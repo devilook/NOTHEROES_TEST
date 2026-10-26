@@ -118,7 +118,8 @@
       initQueue: [], initIndex: 0, pendingInit: null,
       deployQueue: [], deployIndex: 0,
       pointer: 0, round: 1, turn: null,
-      pending: null,          // ожидание ввода посреди боя (возврат проглоченного)
+      pending: null,          // ожидание ввода посреди боя: клетка ('place') или обмен на колесе ('swap')
+      fireTrap: null,         // { cell, seat, hero } — метка Огненной ловушки
       winner: null,
       log: [],
     };
@@ -155,7 +156,7 @@
   function entityName(state, e) {
     const f = FACTIONS[e.faction];
     if (e.kind === 'hero') return f.hero.name + ' (' + f.name + ')';
-    return f.test ? f.name + ' ' + e.name : e.name + ' (' + f.name + ')';
+    return e.name + ' (' + f.name + ')';
   }
 
   function seatName(state, seatNum) {
@@ -219,6 +220,7 @@
       id: 's' + seat.seat + 'h', kind: 'hero', seat: seat.seat, faction: f, num: 0, label: 'Г',
       name: data.hero.name, init: data.hero.init, ability: data.hero.ability,
       alive: true, pos: null, slot: null,
+      abilityState: data.hero.ability && data.hero.ability.kind === 'active' ? 'ready' : null,
     });
   }
 
@@ -310,7 +312,8 @@
   }
 
   // Бросок к30 для e. Возвращает события; если нужен выбор — заводит pendingInit.
-  function determineInitiative(state, e, inBattle) {
+  // resume (в бою): 'advance' — после выбора передать ход дальше, 'turn' — вернуться в текущий ход.
+  function determineInitiative(state, e, inBattle, resume) {
     const value = roll(state, SLOTS);
     const opt = initiativeOptions(state, e, value);
     const events = [{ type: 'roll', die: SLOTS, value, entity: e.id, purpose: 'initiative' }];
@@ -319,7 +322,7 @@
       log(state, entityName(state, e) + ': к30 = ' + value + ', ' + opt.reason + ' → место ' + opt.slot, { seat: e.seat });
       events.push({ type: 'slot', entity: e.id, slot: opt.slot, forced: true });
     } else {
-      state.pendingInit = { entity: e.id, value, mode: opt.mode, options: opt.options, battle: !!inBattle };
+      state.pendingInit = { entity: e.id, value, mode: opt.mode, options: opt.options, battle: !!inBattle, resume: resume || 'advance' };
     }
     return events;
   }
@@ -349,7 +352,7 @@
     log(state, entityName(state, e) + ': к30 = ' + p.value + ' → место ' + slot, { seat: e.seat });
     state.pendingInit = null;
     const events = [{ type: 'slot', entity: e.id, slot }];
-    if (p.battle) events.push(...advance(state));
+    if (p.battle) events.push(...resumeAfter(state, p.resume));
     else advanceInit(state);
     return { ok: true, events };
   }
@@ -439,7 +442,7 @@
     let s = nextOccupied(state, state.pointer);
     if (s === null) {
       events.push(...endRound(state));
-      if (state.phase !== 'battle') return events;
+      if (state.phase !== 'battle' || blocked(state)) return events;
       s = nextOccupied(state, 0);
       if (s === null) return events;
     }
@@ -450,6 +453,7 @@
       mpLeft: e.kind === 'unit' ? e.speed : 0,
       moved: false, acted: false,
       startPos: e.pos && e.pos.slice(),
+      run: { dir: -1, len: 0, best: 0 }, // самый длинный прямой отрезок за ход (Рыцарский разбег)
     };
     return events;
   }
@@ -458,14 +462,57 @@
   function endRound(state) {
     const events = [{ type: 'roundEnd', round: state.round }];
     log(state, 'Конец круга ' + state.round + '.');
+    let swapSeat = null;
     for (const s of state.seats) {
-      if (s.out || !seatHas(state, s.seat, 'regen2')) continue;
-      for (const u of state.entities) {
-        if (u.seat === s.seat && u.kind === 'unit' && u.alive && u.pos) events.push(...heal(state, u, 2, FACTIONS[s.faction].name));
+      if (s.out) continue;
+      if (seatHas(state, s.seat, 'regen2')) {
+        for (const u of state.entities) {
+          if (u.seat === s.seat && u.kind === 'unit' && u.alive && u.pos) events.push(...heal(state, u, 2, FACTIONS[s.faction].name));
+        }
       }
+      if (seatHas(state, s.seat, 'tithe10')) {
+        s.coins += 10;
+        log(state, FACTIONS[s.faction].hero.name + ': +10 монет (' + FACTIONS[s.faction].name + ')', { seat: s.seat });
+        events.push({ type: 'coins', seat: s.seat, amount: 10, source: FACTIONS[s.faction].name });
+      }
+      if (seatHas(state, s.seat, 'wheelSwap') && swapCandidates(state, s.seat).length >= 2) swapSeat = s.seat;
     }
     state.round++;
+    state.pointer = 0;
+    if (swapSeat) {
+      state.pending = { type: 'swap', seat: swapSeat };
+      events.push({ type: 'pending', pending: 'swap' });
+    }
     return events;
+  }
+
+  // ---------- Демоны: обмен местами на колесе в конце круга ----------
+
+  function swapCandidates(state, seat) {
+    return state.entities.filter((e) => e.seat === seat && e.kind === 'unit' && e.alive && e.slot).map((e) => e.id);
+  }
+
+  function swapOnWheel(state, idA, idB) {
+    const p = state.pending;
+    if (!p || p.type !== 'swap') return { ok: false, error: 'Сейчас не обмен на колесе' };
+    const c = swapCandidates(state, p.seat);
+    if (!c.includes(idA) || !c.includes(idB) || idA === idB) return { ok: false, error: 'Выберите двух своих юнитов на колесе' };
+    const a = entity(state, idA), b = entity(state, idB);
+    [a.slot, b.slot] = [b.slot, a.slot];
+    state.wheel[a.slot] = a.id;
+    state.wheel[b.slot] = b.id;
+    state.pending = null;
+    log(state, entityName(state, a) + ' и ' + entityName(state, b) + ' поменялись местами на колесе', { seat: p.seat });
+    const events = [{ type: 'swap', a: a.id, b: b.id }];
+    events.push(...advance(state));
+    return { ok: true, events };
+  }
+
+  function skipSwap(state) {
+    const p = state.pending;
+    if (!p || p.type !== 'swap') return { ok: false, error: 'Сейчас не обмен на колесе' };
+    state.pending = null;
+    return { ok: true, events: advance(state) };
   }
 
   function current(state) {
@@ -479,6 +526,8 @@
     const e = current(state);
     state.turn = null;
     const events = [];
+    // «Способность заканчивается в конце хода цели»: Ослепляющая пыльца, Опутывание корнями
+    if (e) for (const k of ['blinded', 'rooted']) if (e[k]) events.push(...endStatus(state, e, k));
     if (e && e.alive && e.swallowing) {
       if (e.swallowing.stage === 'used') {
         e.swallowing.stage = 'holding';
@@ -562,7 +611,7 @@
 
   function canMove(state) {
     const t = state.turn;
-    return !!(t && !blocked(state) && t.kind === 'unit' && !t.acted && t.mpLeft > 0);
+    return !!(t && !blocked(state) && t.kind === 'unit' && !t.acted && t.mpLeft > 0 && !current(state).rooted);
   }
 
   function turnReach(state) {
@@ -578,8 +627,18 @@
     u.pos = [c, r];
     state.turn.mpLeft -= target.steps;
     state.turn.moved = true;
+    trackRun(state.turn.run, target.path);
     const events = [{ type: 'move', entity: u.id, path: target.path }];
     log(state, entityName(state, u) + ': ' + target.steps + ' кл. → ' + cellName(c, r), { seat: u.seat });
+    if (state.fireTrap && state.fireTrap.cell[0] === c && state.fireTrap.cell[1] === r) {
+      events.push(...triggerFireTrap(state, u));
+      checkVictory(state);
+      if (!u.alive) {
+        events.push({ type: 'turnEnded', reason: 'гибель' });
+        if (state.phase === 'battle') events.push(...finishTurn(state));
+        return { ok: true, events, path: target.path };
+      }
+    }
     if (target.token) {
       events.push(...openToken(state, u, c, r));
       checkVictory(state);
@@ -589,6 +648,16 @@
     return { ok: true, events, path: target.path };
   }
 
+  // Длина прямого отрезка: шаги в одном направлении подряд, в том числе через несколько движений.
+  function trackRun(run, path) {
+    for (let i = 1; i < path.length; i++) {
+      const d = DIRS.findIndex(([dc, dr]) => path[i][0] - path[i - 1][0] === dc && path[i][1] - path[i - 1][1] === dr);
+      run.len = d === run.dir ? run.len + 1 : 1;
+      run.dir = d;
+      run.best = Math.max(run.best, run.len);
+    }
+  }
+
   function undoMove(state) {
     const t = state.turn;
     if (!t || t.kind !== 'unit' || t.acted || !t.moved) return { ok: false, error: 'Нечего отменять' };
@@ -596,6 +665,7 @@
     u.pos = t.startPos.slice();
     t.mpLeft = u.speed;
     t.moved = false;
+    t.run = { dir: -1, len: 0, best: 0 };
     log(state, entityName(state, u) + ': движение отменено', { seat: u.seat });
     return { ok: true, events: [] };
   }
@@ -655,6 +725,8 @@
     log(state, entityName(state, e) + ' погибает', { seat: e.seat });
     const events = [{ type: 'death', entity: e.id }];
     const seat = seatOf(state, e.seat);
+    for (const k of ['blinded', 'rooted', 'hunted']) if (e[k]) events.push(...endStatus(state, e, k));
+    if (e.kind === 'unit' && seatHas(state, e.seat, 'soothe')) events.push(...soothe(state, e.seat));
     if (e.kind === 'unit' && seatHas(state, e.seat, 'collector50')) {
       seat.coins += 50;
       log(state, FACTIONS[seat.faction].hero.name + ': +50 монет (' + FACTIONS[seat.faction].hero.ability.name + ')', { seat: e.seat });
@@ -707,7 +779,7 @@
         if (!inBounds(state.map, c, r)) break;
         const t = unitAt(state, c, r);
         if (t) {
-          if (t.seat !== a.seat) out.push({ id: t.id, penalty, dist });
+          if (t.seat !== a.seat) out.push({ id: t.id, penalty: has(a, 'bullseye') ? 0 : penalty, dist });
           if (!has(t, 'incorporeal')) penalty++;
         }
       }
@@ -717,7 +789,7 @@
 
   function canAttack(state) {
     const t = state.turn;
-    return !!(t && !blocked(state) && t.kind === 'unit' && !t.acted);
+    return !!(t && !blocked(state) && t.kind === 'unit' && !t.acted && !current(state).blinded);
   }
 
   function turnTargets(state) {
@@ -725,19 +797,31 @@
   }
 
   // Один удар: к6 + атака − штраф; защитник вычитает броню. Минимум 0.
-  // Плюс способности: Бестелесность, Кровопийца, Острый панцирь.
+  // Плюс способности: максимальный урон (Адская охота, Рыцарский разбег), Бестелесность,
+  // Поднять щиты!, Кровопийца, Дьявольские когти, Острый панцирь.
   function strike(state, atk, def, penalty, purpose) {
-    const value = roll(state, 6);
+    let max = null;
+    if (purpose === 'attack' && def.hunted && entity(state, def.hunted.by).seat === atk.seat) max = 'Адская охота';
+    if (purpose === 'attack' && has(atk, 'charge') && state.turn && state.turn.entity === atk.id && state.turn.run.best >= 5) max = atk.ability.name;
+    const value = max ? 6 : roll(state, 6);
     const raw = Math.max(0, value + atk.atk - penalty);
     const events = [{ type: 'roll', die: 6, value, entity: atk.id, target: def.id, purpose,
-      mod: atk.atk, penalty, total: raw, armor: def.armor }];
+      mod: atk.atk, penalty, total: raw, armor: def.armor, max }];
+    if (max) log(state, entityName(state, atk) + ': максимальный урон (' + max + ')', { seat: atk.seat });
+    if (max === 'Адская охота') events.push(...endStatus(state, def, 'hunted'));
+    let hit = true;
     if (has(def, 'incorporeal') && value % 2 === 1) {
-      log(state, entityName(state, def) + ': на кости ' + value + ' — урона нет (' + def.ability.name + ')', { seat: def.seat });
+      hit = false;
+      log(state, entityName(state, def) + ': на кости ' + value + ' — промах (' + def.ability.name + ')', { seat: def.seat });
       events.push({ type: 'immune', entity: def.id, raw, reason: def.ability.name + ': выпало ' + value });
+    } else if (has(def, 'shieldsUp') && atk.atkType === 'ranged') {
+      log(state, entityName(state, def) + ': дальняя атака не наносит урона (' + def.ability.name + ')', { seat: def.seat });
+      events.push({ type: 'immune', entity: def.id, raw, reason: def.ability.name });
     } else {
       events.push(...applyDamage(state, def, raw));
     }
-    if (atk.alive && has(atk, 'lifesteal1')) events.push(...heal(state, atk, 1, atk.ability.name));
+    if (hit && atk.alive && has(atk, 'lifesteal1')) events.push(...heal(state, atk, 1, atk.ability.name));
+    if (hit && atk.alive && def.alive && has(atk, 'claws')) events.push(...applyDamage(state, def, 1, { pure: true, source: atk.ability.name }));
     if (atk.alive && atk.atkType === 'melee' && has(def, 'spikes2')) {
       events.push(...applyDamage(state, atk, 2, { pure: true, source: def.ability.name }));
     }
@@ -748,6 +832,8 @@
   // «+» всегда, «Х» никогда, «=» к6: 4–6 — да.
   function counter(state, atk, def) {
     if (!def.alive || !atk.alive || !def.pos || !atk.pos) return [];
+    if (seatHas(state, atk.seat, 'noCounter')) return [{ type: 'text', text: 'Отпора нет: ' + FACTIONS[atk.faction].name + ' не получают отпор' }];
+    if (def.blinded) return [{ type: 'text', text: 'Отпора нет: ' + entityName(state, def) + ' ослеплён' }];
     const adjacent = Math.abs(atk.pos[0] - def.pos[0]) + Math.abs(atk.pos[1] - def.pos[1]) === 1;
     if (!adjacent || def.counter === 'x') return [];
     const reach = attackTargets(state, def).find((t) => t.id === atk.id);
@@ -767,10 +853,23 @@
   // После действия: если юнит погиб или уже двигался — делать больше нечего, ход заканчивается.
   function afterAction(state, a, events) {
     checkVictory(state);
-    if (state.phase === 'battle' && state.turn && state.turn.entity === a.id && (!a.alive || state.turn.moved)) {
+    if (state.phase !== 'battle' || !state.turn || state.turn.entity !== a.id) return;
+    if (!a.alive || state.turn.moved) {
+      if (blocked(state)) { state.turn.autoEnd = true; return; } // закончим после выбора клетки или места
       events.push({ type: 'turnEnded', reason: a.alive ? 'действие после движения' : 'гибель' });
       events.push(...finishTurn(state));
     }
+  }
+
+  // Продолжение после выбора посреди боя.
+  function resumeAfter(state, resume) {
+    if (blocked(state) || state.phase !== 'battle') return [];
+    if (resume === 'advance') return advance(state);
+    const t = state.turn;
+    if (t && (t.autoEnd || !current(state).alive)) {
+      return [{ type: 'turnEnded', reason: 'действие после движения' }].concat(finishTurn(state));
+    }
+    return [];
   }
 
   function attack(state, targetId) {
@@ -790,37 +889,86 @@
 
   // ---------- Активные способности ----------
 
-  // Способность с дальностью работает ортогонально и диагонально; стены мешают.
-  // По диагонали на 1 клетку — путь закрыт, если оба обхода через угол упираются в стену.
-  function abilityLineClear(state, a, b) {
-    const dc = b[0] - a[0], dr = b[1] - a[1];
-    const wall = (c, r, x, y) => edgeBetween(state.map, c, r, x, y) === 'wall';
-    if (Math.abs(dc) + Math.abs(dr) === 1) return !wall(a[0], a[1], dc, dr);
-    const viaH = !wall(a[0], a[1], dc, 0) && !wall(a[0] + dc, a[1], 0, dr);
-    const viaV = !wall(a[0], a[1], 0, dr) && !wall(a[0], a[1] + dr, dc, 0);
+  // Шаг по линии способности. Полные стены мешают (если способность не игнорирует их),
+  // полустены — нет. По диагонали путь закрыт, если оба обхода через угол упираются в стену.
+  function stepClear(state, c, r, dc, dr) {
+    const wall = (x, y, ddc, ddr) => edgeBetween(state.map, x, y, ddc, ddr) === 'wall';
+    if (dc === 0 || dr === 0) return !wall(c, r, dc, dr);
+    const viaH = !wall(c, r, dc, 0) && !wall(c + dc, r, 0, dr);
+    const viaV = !wall(c, r, 0, dr) && !wall(c, r + dr, dc, 0);
     return viaH || viaV;
   }
 
-  function abilityTargets(state) {
-    const t = state.turn;
-    if (!t || blocked(state) || t.kind !== 'unit' || t.acted) return [];
-    const a = current(state);
-    if (!a.ability || a.ability.kind !== 'active' || a.abilityState !== 'ready') return [];
-    const range = a.ability.range || 1;
-    return state.entities.filter((e) => e.alive && e.pos && e.id !== a.id &&
-      Math.max(Math.abs(e.pos[0] - a.pos[0]), Math.abs(e.pos[1] - a.pos[1])) <= range &&
-      (range > 1 || abilityLineClear(state, a.pos, e.pos))).map((e) => e.id);
+  const LINES = [[0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1]];
+
+  // Клетки в радиусе: только на 8 линиях (ортогонали и диагонали), не дальше radius.
+  function radiusCells(state, from, radius, ignoreWalls) {
+    const out = [];
+    for (const [dc, dr] of LINES) {
+      let c = from[0], r = from[1];
+      for (let i = 1; i <= radius; i++) {
+        if (!inBounds(state.map, c + dc, r + dr)) break;
+        if (!ignoreWalls && !stepClear(state, c, r, dc, dr)) break;
+        c += dc; r += dr;
+        out.push([c, r]);
+      }
+    }
+    return out;
   }
 
-  function useAbility(state, targetId) {
-    if (!abilityTargets(state).includes(targetId)) return { ok: false, error: 'Способность сейчас недоступна для этой цели' };
+  function unitsInRadius(state, from, radius, ignoreWalls) {
+    return radiusCells(state, from, radius, ignoreWalls).map(([c, r]) => unitAt(state, c, r)).filter(Boolean);
+  }
+
+  function abilityOwner(state) {
+    const t = state.turn;
+    if (!t || blocked(state) || t.acted) return null;
     const a = current(state);
-    const t = entity(state, targetId);
+    if (!a.ability || a.ability.kind !== 'active' || a.ability.pending) return null;
+    if (a.ability.id === 'fireTrap') return a.abilityState === 'spent' ? null : a;
+    return a.abilityState === 'ready' ? a : null;
+  }
+
+  // Цели активной способности текущего персонажа: id юнитов, 'self' или клетки [c, r].
+  function abilityTargets(state) {
+    const a = abilityOwner(state);
+    if (!a) return [];
+    const ab = a.ability;
+    if (ab.target === 'self') return ['self'];
+    if (ab.target === 'cell') {
+      const out = [];
+      for (let r = 0; r < state.map.rows; r++) for (let c = 0; c < state.map.cols; c++) {
+        const busy = state.fireTrap && state.fireTrap.cell[0] === c && state.fireTrap.cell[1] === r;
+        if (state.map.cells[r][c].kind === 'floor' && !unitAt(state, c, r) && !busy) out.push([c, r]);
+      }
+      return out;
+    }
+    if (ab.target === 'allyDead') {
+      return state.entities.filter((e) => e.seat === a.seat && e.kind === 'unit' && !e.alive).map((e) => e.id);
+    }
+    const pool = ab.radius ? unitsInRadius(state, a.pos, ab.radius, ab.ignoreWalls)
+      : state.entities.filter((e) => e.alive && e.pos);
+    return pool.filter((e) => e.id !== a.id && e.kind === 'unit' &&
+      (ab.target === 'any' || (ab.target === 'ally' ? e.seat === a.seat : e.seat !== a.seat))).map((e) => e.id);
+  }
+
+  // target: id юнита, 'self' или [c, r] для клетки.
+  function useAbility(state, target) {
+    const targets = abilityTargets(state);
+    const ok = Array.isArray(target)
+      ? targets.some((x) => Array.isArray(x) && x[0] === target[0] && x[1] === target[1])
+      : targets.includes(target);
+    if (!ok) return { ok: false, error: 'Способность сейчас недоступна для этой цели' };
+    const a = current(state);
+    const ab = a.ability;
+    const t = typeof target === 'string' && target !== 'self' ? entity(state, target) : null;
     state.turn.acted = true;
-    const events = [{ type: 'ability', entity: a.id, target: t.id, name: a.ability.name }];
-    log(state, entityName(state, a) + ': ' + a.ability.name + ' → ' + entityName(state, t), { seat: a.seat });
-    if (a.ability.id === 'swallow') {
-      events.push(...applyDamage(state, t, 3, { pure: true, source: a.ability.name }));
+    const events = [{ type: 'ability', entity: a.id, target: t ? t.id : null, name: ab.name }];
+    log(state, entityName(state, a) + ': ' + ab.name + (t ? ' → ' + entityName(state, t) : ''), { seat: a.seat });
+    const spend = () => { a.abilityState = 'spent'; };
+
+    if (ab.id === 'swallow') {
+      events.push(...applyDamage(state, t, 3, { pure: true, source: ab.name }));
       if (t.alive) {
         state.wheel[t.slot] = null;
         t.slot = null;
@@ -830,12 +978,88 @@
         a.abilityState = 'active';
         log(state, entityName(state, t) + ' проглочен: исчезает с карты и колеса', { seat: t.seat });
         events.push({ type: 'swallowed', entity: t.id, by: a.id });
-      } else {
-        a.abilityState = 'spent';
-      }
+      } else spend();
+    } else if (ab.id === 'blindDust') {
+      t.blinded = { by: a.id };
+      a.abilityState = 'active';
+      log(state, entityName(state, t) + ' ослеплён до конца своего хода', { seat: t.seat });
+      events.push({ type: 'status', entity: t.id, status: 'blinded' });
+    } else if (ab.id === 'roots') {
+      events.push(...applyDamage(state, t, 2, { pure: true, source: ab.name }));
+      if (t.alive) {
+        t.rooted = { by: a.id };
+        a.abilityState = 'active';
+        log(state, entityName(state, t) + ' опутан до конца своего хода', { seat: t.seat });
+        events.push({ type: 'status', entity: t.id, status: 'rooted' });
+      } else spend();
+    } else if (ab.id === 'hunt') {
+      t.hunted = { by: a.id };
+      a.abilityState = 'active';
+      log(state, entityName(state, t) + ' помечен: следующая атака союзника — максимальный урон', { seat: t.seat });
+      events.push({ type: 'status', entity: t.id, status: 'hunted' });
+    } else if (ab.id === 'blast') {
+      spend();
+      for (const v of unitsInRadius(state, a.pos, 1, false)) events.push(...applyDamage(state, v, 5, { pure: true, source: ab.name }));
+    } else if (ab.id === 'arrowRain') {
+      spend();
+      const hit = [t].concat(unitsInRadius(state, t.pos, 1, true));
+      for (const v of hit) if (v.alive) events.push(...applyDamage(state, v, 3, { pure: true, source: ab.name }));
+    } else if (ab.id === 'healWord') {
+      spend();
+      events.push(...heal(state, t, 3, ab.name));
+    } else if (ab.id === 'hellGate') {
+      spend();
+      events.push(...askPlace(state, { reason: 'hellGate', target: t.id, source: a.id, near: a.pos, resume: 'turn' }));
+    } else if (ab.id === 'rebirth') {
+      spend();
+      events.push(...askPlace(state, { reason: 'rebirth', target: t.id, source: a.id, near: a.pos, resume: 'turn' }));
+    } else if (ab.id === 'fireTrap') {
+      const moved = !!state.fireTrap;
+      state.fireTrap = { cell: target.slice(), seat: a.seat, hero: a.id };
+      a.abilityState = 'active';
+      log(state, ab.name + (moved ? ': метка переставлена на ' : ': метка на ') + cellName(target[0], target[1]), { seat: a.seat });
+      events.push({ type: 'trap', cell: target.slice(), moved });
     }
     afterAction(state, a, events);
     return { ok: true, events };
+  }
+
+  function endStatus(state, e, k) {
+    const st = e[k];
+    delete e[k];
+    const src = st && entity(state, st.by);
+    if (src && src.abilityState === 'active') src.abilityState = 'spent';
+    const names = { blinded: 'ослепление', rooted: 'корни', hunted: 'метка охоты' };
+    log(state, entityName(state, e) + ': ' + names[k] + ' спадает', { seat: e.seat });
+    return [{ type: 'statusEnd', entity: e.id, status: k }];
+  }
+
+  function triggerFireTrap(state, u) {
+    const ft = state.fireTrap;
+    state.fireTrap = null;
+    const hero = entity(state, ft.hero);
+    if (hero) hero.abilityState = 'spent';
+    const events = [{ type: 'trapFired', entity: u.id, cell: ft.cell }];
+    events.push(...applyDamage(state, u, 10, { pure: true, source: 'Огненная ловушка' }));
+    return events;
+  }
+
+  // Сильваны: погиб свой юнит — союзник перезаряжает способность и получает +5.
+  // Союзника выбирает игрок (вопрос 31); пока автоматически: с разряженной способностью, иначе самый раненый.
+  function soothe(state, seatNum) {
+    const allies = state.entities.filter((e) => e.seat === seatNum && e.kind === 'unit' && e.alive && e.pos);
+    if (!allies.length) return [];
+    allies.sort((x, y) => (y.abilityState === 'spent') - (x.abilityState === 'spent') || x.hp / x.maxHp - y.hp / y.maxHp);
+    const t = allies[0];
+    const name = FACTIONS[seatOf(state, seatNum).faction].hero.ability.name;
+    const events = [];
+    if (t.abilityState === 'spent') {
+      t.abilityState = 'ready';
+      log(state, entityName(state, t) + ': способность перезаряжена (' + name + ')', { seat: seatNum });
+      events.push({ type: 'recharge', entity: t.id, source: name });
+    }
+    events.push(...heal(state, t, 5, name));
+    return events;
   }
 
   // Свободные клетки на минимальном расстоянии (по клеткам, без учёта стен) от from.
@@ -849,21 +1073,54 @@
     return out;
   }
 
-  // Конец следующего хода голема: цель возвращается. Несколько ближайших клеток —
-  // выбирает владелец голема.
-  function beginReturn(state, golem) {
-    const options = nearestFreeCells(state, golem.pos);
-    if (options.length === 1) return releaseFromGolem(state, golem, options[0]);
-    state.pending = { type: 'return', golem: golem.id, target: golem.swallowing.target, options };
-    return [{ type: 'pending', pending: 'return' }];
+  // Поставить юнита на ближайшую к near свободную клетку. Несколько вариантов — выбирает игрок.
+  function askPlace(state, p) {
+    const options = nearestFreeCells(state, p.near);
+    if (options.length === 1) return applyPlace(state, p, options[0]);
+    state.pending = Object.assign({ type: 'place', options }, p);
+    return [{ type: 'pending', pending: 'place' }];
   }
 
-  function releaseFromGolem(state, golem, cell) {
-    const t = entity(state, golem.swallowing.target);
-    golem.swallowing = null;
-    golem.abilityState = 'spent';
-    log(state, entityName(state, golem) + ': способность закончилась', { seat: golem.seat });
-    return releaseSwallowed(state, t, cell, false);
+  function applyPlace(state, p, cell) {
+    const t = entity(state, p.target);
+    const events = [];
+    if (p.reason === 'swallowReturn') {
+      const g = entity(state, p.source);
+      g.swallowing = null;
+      g.abilityState = 'spent';
+      log(state, entityName(state, g) + ': способность закончилась', { seat: g.seat });
+      events.push(...releaseSwallowed(state, t, cell, false));
+    } else if (p.reason === 'hellGate') {
+      const from = t.pos;
+      t.pos = cell;
+      log(state, entityName(state, t) + ' проходит через Адские врата на ' + cellName(cell[0], cell[1]), { seat: t.seat });
+      events.push({ type: 'teleport', entity: t.id, from, cell });
+    } else if (p.reason === 'rebirth') {
+      t.alive = true;
+      t.hp = 3;
+      t.pos = cell;
+      const seat = seatOf(state, t.seat);
+      log(state, entityName(state, t) + ' воскрешён на ' + cellName(cell[0], cell[1]) + ' с 3 здоровья', { seat: t.seat });
+      events.push({ type: 'revived', entity: t.id, cell });
+      if (seat.out) seat.out = false;
+      events.push(...determineInitiative(state, t, true, 'turn'));
+    }
+    return events;
+  }
+
+  function choosePlace(state, c, r) {
+    const p = state.pending;
+    if (!p || p.type !== 'place') return { ok: false, error: 'Сейчас не нужно выбирать клетку' };
+    if (!p.options.some(([x, y]) => x === c && y === r)) return { ok: false, error: 'Выберите одну из подсвеченных клеток' };
+    state.pending = null;
+    const events = applyPlace(state, p, [c, r]);
+    events.push(...resumeAfter(state, p.resume));
+    return { ok: true, events };
+  }
+
+  // Конец следующего хода голема: цель возвращается.
+  function beginReturn(state, golem) {
+    return askPlace(state, { reason: 'swallowReturn', target: golem.swallowing.target, source: golem.id, near: golem.pos, resume: 'advance' });
   }
 
   // Цель выходит на клетку и заново определяет инициативу (к30).
@@ -872,7 +1129,7 @@
     delete t.swallowedBy;
     log(state, entityName(state, t) + ' возвращается на ' + cellName(cell[0], cell[1]), { seat: t.seat });
     const events = [{ type: 'released', entity: t.id, cell }];
-    events.push(...determineInitiative(state, t, true));
+    events.push(...determineInitiative(state, t, true, 'advance'));
     if (auto && state.pendingInit) {
       const p = state.pendingInit;
       const slot = bestOption(p);
@@ -884,13 +1141,30 @@
     return events;
   }
 
-  function chooseReturnCell(state, c, r) {
-    const p = state.pending;
-    if (!p || p.type !== 'return') return { ok: false, error: 'Сейчас не нужно выбирать клетку' };
-    if (!p.options.some(([x, y]) => x === c && y === r)) return { ok: false, error: 'Выберите одну из ближайших свободных клеток' };
-    state.pending = null;
-    const events = releaseFromGolem(state, entity(state, p.golem), [c, r]);
-    if (!state.pendingInit) events.push(...advance(state));
+  // ---------- Бес: Душевные муки ----------
+
+  // Бес не действовал и не менял инициативу — может ударить любого врага на 1 чистого.
+  // Применение заканчивает ход (сдвигаться после уже нельзя).
+  function tormentTargets(state) {
+    const t = state.turn;
+    if (!t || blocked(state) || t.acted) return [];
+    const a = current(state);
+    if (!has(a, 'torment')) return [];
+    return state.entities.filter((e) => e.alive && e.pos && e.kind === 'unit' && e.seat !== a.seat).map((e) => e.id);
+  }
+
+  function torment(state, targetId) {
+    if (!tormentTargets(state).includes(targetId)) return { ok: false, error: 'Душевные муки сейчас недоступны' };
+    const a = current(state);
+    const t = entity(state, targetId);
+    log(state, entityName(state, a) + ': ' + a.ability.name + ' → ' + entityName(state, t), { seat: a.seat });
+    const events = [{ type: 'ability', entity: a.id, target: t.id, name: a.ability.name }];
+    events.push(...applyDamage(state, t, 1, { pure: true, source: a.ability.name }));
+    checkVictory(state);
+    if (state.phase === 'battle') {
+      events.push({ type: 'turnEnded', reason: a.ability.name });
+      events.push(...finishTurn(state));
+    }
     return { ok: true, events };
   }
 
@@ -898,7 +1172,8 @@
 
   function canShift(state) {
     const t = state.turn;
-    return !!(t && !blocked(state) && !t.moved);
+    const e = current(state);
+    return !!(t && !blocked(state) && !t.moved && !(e && (e.blinded || e.rooted)));
   }
 
   function shiftOptions(state) {
@@ -946,7 +1221,8 @@
     deployCurrent, canDeploy, deploy, autoDeploy,
     current, computeReach, turnReach, canMove, move, undoMove,
     attackTargets, turnTargets, canAttack, attack,
-    abilityTargets, useAbility, chooseReturnCell, nearestFreeCells,
+    abilityTargets, useAbility, choosePlace, chooseReturnCell: choosePlace, nearestFreeCells, radiusCells,
+    tormentTargets, torment, swapCandidates, swapOnWheel, skipSwap,
     canShift, shiftOptions, shift, endTurn, cellName,
   };
 });

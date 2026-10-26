@@ -37,7 +37,20 @@
     return esc(t)
       .replace(/(\d+ )?чист(ый|ого) урон[а]?/gi, (m) => `<b class="pure">${m}</b>`)
       .replace(/\+(\d+) здоровья/g, (m, n) => `<b class="heal">+${n} здоровья</b>`)
-      .replace(/(\d+) монет/g, (m, n) => `<b class="gold">${n} монет</b>`);
+      .replace(/(\d+) монет/g, (m, n) => `<b class="gold">${n} монет</b>`)
+      .replace(/(?<![+\d])(\d+) здоровья/g, (m, n) => `<b class="heal">${n} здоровья</b>`)
+      .replace(/максимальный урон/gi, (m) => `<b class="maxdmg">${m}</b>`);
+  }
+
+  function stateBadge(st) {
+    return `<span class="ab-state s-${st}">${{ ready: 'заряжена', active: 'активна', spent: 'разряжена' }[st]}</span>`;
+  }
+
+  // Портрет с ширмы, если он есть; иначе крупная римская цифра.
+  function portrait(opts, file, fallback) {
+    const roman = `<span class="big-roman">${fallback}</span>`;
+    if (!opts.portraits) return roman;
+    return `<img class="art" src="assets/portraits/${opts.key}/${file}.jpg" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'big-roman',textContent:'${fallback}'}))">`;
   }
 
   function statCell(cls, icon, value, title, extra) {
@@ -56,19 +69,20 @@
       else {
         if (live.slot) status += `<span class="tag">место ${live.slot}</span>`;
         if (live.pos) status += `<span class="tag">${E.cellName(...live.pos)}</span>`;
+        if (live.blinded) status += '<span class="tag warn">ослеплён</span>';
+        if (live.rooted) status += '<span class="tag warn">опутан</span>';
+        if (live.hunted) status += '<span class="tag warn">метка охоты</span>';
       }
     }
     const ab = u.ability;
     let abState = '';
-    if (ab && ab.kind === 'active') {
-      const st = live ? live.abilityState : 'ready';
-      abState = `<span class="ab-state s-${st}">${{ ready: 'заряжена', active: 'активна', spent: 'разряжена' }[st]}</span>`;
-    }
+    if (ab && ab.pending) abState = '<span class="ab-state s-pending">ждёт уточнения</span>';
+    else if (ab && ab.kind === 'active') abState = stateBadge(live ? live.abilityState : 'ready');
     const isActive = opts.activeId && live && live.id === opts.activeId;
     return `<article class="ucard${live && !live.alive ? ' is-dead' : ''}${isActive ? ' is-active' : ''}">
-      <header class="ribbon"><span class="emb">${opts.emblem}</span><h3>${roman}. ${esc(opts.test ? 'Юнит ' + u.name : u.name)}</h3></header>
+      <header class="ribbon"><span class="emb">${opts.emblem}</span><h3>${roman}. ${esc(u.name)}</h3></header>
       <div class="ucard-body">
-        <div class="portrait"><span class="big-roman">${roman}</span><span class="token-mini">${u.num}</span><div class="tags">${status}</div></div>
+        <div class="portrait">${portrait(opts, u.num, roman)}<span class="token-mini">${u.num}</span><div class="tags">${status}</div></div>
         <div class="stats">
           <div class="hp-cell" title="Здоровье"><span class="hp-now">${hp}<small>/${u.hp}</small></span><span class="heart">${ICONS.heart}<b>${u.hp}</b></span></div>
           ${statCell('atk', u.atkType === 'ranged' ? ICONS.bow : ICONS.sword, (u.atk >= 0 ? '+' : '') + u.atk,
@@ -79,7 +93,7 @@
           ${statCell('ini', ICONS.hourglass, u.init, 'Инициатива')}
         </div>
       </div>
-      <div class="ability">${ab ? `<h4>${esc(ab.name)} ${abState}</h4><p>${abilityText(ab.text)}</p>${ab.range ? `<span class="corner ab-range" title="Дальность способности (допущение)">${ab.range}</span>` : ''}` : '<p class="none">Способности пока нет: тестовый юнит.</p>'}</div>
+      <div class="ability">${ab ? `<h4>${esc(ab.name)} ${abState}</h4><p>${abilityText(ab.text)}</p>${ab.radius ? `<span class="corner ab-range" title="Радиус способности: клетки на 8 линиях от юнита">${ab.radius}</span>` : ''}` : ''}</div>
     </article>`;
   }
 
@@ -92,7 +106,7 @@
     return `<article class="ucard hero${isActive ? ' is-active' : ''}">
       <header class="ribbon"><span class="emb">${opts.emblem}</span><h3><small>Герой:</small> ${esc(h.name)}</h3></header>
       <div class="ucard-body">
-        <div class="portrait"><span class="big-roman">Г</span><div class="tags">${status}</div></div>
+        <div class="portrait">${portrait(opts, 'hero', 'Г')}<div class="tags">${status}</div></div>
         <div class="stats">
           <div class="hp-cell coins-cell" title="Монеты сейчас"><span class="hp-now">${coins}</span><span class="coin">${ICONS.coin}</span></div>
           <div class="st gold" title="Стартовые монеты"><span class="ico coin-ico">${ICONS.coin}</span><span class="val">${h.coins}</span></div>
@@ -100,7 +114,7 @@
           ${seat ? `<div class="st loot" title="Найдено на карте: предметы и ловушки (эффекты позже)"><span class="val">${seat.items}<small> пр.</small> · ${seat.traps}<small> лов.</small></span></div>` : ''}
         </div>
       </div>
-      <div class="ability">${ab ? `<h4>${esc(ab.name)}</h4><p>${abilityText(ab.text)}</p>` : '<p class="none">Способности пока нет: тестовый герой.</p>'}</div>
+      <div class="ability">${ab ? `<h4>${esc(ab.name)} ${ab.kind === 'active' ? stateBadge(live ? live.abilityState : 'ready') : ''}</h4><p>${abilityText(ab.text)}</p>` : ''}</div>
     </article>`;
   }
 
@@ -111,13 +125,13 @@
     const emblem = EMBLEMS[f.key];
     const seat = game && seatNum ? E.seatOf(game, seatNum) : null;
     const live = (id) => (game && seatNum ? E.entity(game, id) : null);
-    const o = { emblem, test: f.test, activeId: opts.activeId };
+    const o = { emblem, activeId: opts.activeId, portraits: !!f.portraits, key: f.key };
     return `<div class="screen f${f.id}">
       <div class="screen-top">
         <span class="emb big">${emblem}</span>
         <div class="screen-head">
           <h2 class="screen-title">Фракция: <em>${esc(f.name)}</em></h2>
-          <p class="faction-ability">${f.ability ? abilityText(f.ability.text) : 'Способности фракции пока нет: тестовая фракция.'}</p>
+          <p class="faction-ability">${f.ability ? abilityText(f.ability.text) : ''}</p>
         </div>
         <span class="emb big">${emblem}</span>
       </div>

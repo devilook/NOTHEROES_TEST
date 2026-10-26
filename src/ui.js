@@ -21,7 +21,8 @@
     preview: null,    // ключ клетки, путь до которой показан
     anim: null,       // { entity, path, start }
     hoverSlot: null,
-    mode: 'attack',   // 'attack' | 'ability' — что делает клик по юниту
+    mode: 'attack',   // 'attack' | 'ability' | 'torment' — что делает клик по полю
+    swapPick: [],     // выбранные для обмена на колесе (Демоны)
     screenSeat: null, // чья ширма открыта (null — того, кто сейчас действует)
     previewFaction: 4,
     message: '',
@@ -81,7 +82,8 @@
     if (!game) return null;
     if (game.phase === 'factions') return { seat: E.picker(game) };
     if (game.pendingInit) return E.entity(game, game.pendingInit.entity);
-    if (game.pending) return E.entity(game, game.pending.golem);
+    if (game.pending && game.pending.type === 'place') return E.entity(game, game.pending.source);
+    if (game.pending && game.pending.type === 'swap') return { seat: game.pending.seat };
     if (game.phase === 'initiative') return E.initCurrent(game);
     if (game.phase === 'deploy') return E.deployCurrent(game);
     if (game.phase === 'battle') return E.current(game);
@@ -141,6 +143,12 @@
       el('rect', { x: cx(c) + 6, y: cy(r) + 6, width: S - 12, height: S - 12, rx: 4 }, g);
       el('text', { x: cx(c) + S / 2, y: cy(r) + S / 2 + 1 }, g, '?');
     }
+    if (game && game.fireTrap) {
+      const [c, r] = game.fireTrap.cell;
+      const g = el('g', { class: 'fire-trap', transform: `translate(${cx(c) + S / 2} ${cy(r) + S / 2})` }, layer);
+      el('rect', { x: -S / 2 + 2, y: -S / 2 + 2, width: S - 4, height: S - 4, rx: 3 }, g);
+      el('path', { d: 'M0 -11C5 -5 9 -1 7 5 5 10 -5 10 -7 5 -9 -1 -3 -3 0 -11z' }, g);
+    }
   }
 
   function marker(ov, cls, x, y) {
@@ -161,8 +169,8 @@
       }
     }
 
-    if (game.phase === 'battle' && game.pending && game.pending.type === 'return') {
-      const g = E.entity(game, game.pending.golem);
+    if (game.phase === 'battle' && game.pending && game.pending.type === 'place') {
+      const g = E.entity(game, game.pending.source);
       for (const [c, r] of game.pending.options) el('rect', { x: cx(c) + 3, y: cy(r) + 3, width: S - 6, height: S - 6, rx: 4, class: 'place-target f' + g.faction }, ov);
     }
 
@@ -188,12 +196,27 @@
         }
       }
       if (ui.mode === 'ability') {
-        for (const id of E.abilityTargets(game)) marker(ov, 'target ability', ...mid(...E.entity(game, id).pos));
+        for (const x of E.abilityTargets(game)) {
+          if (Array.isArray(x)) continue; // клетки (ловушка) подсвечиваются при наведении
+          const e = E.entity(game, x);
+          if (e && e.pos) marker(ov, 'target ability', ...mid(...e.pos));
+        }
+        if (ui.hover && cellTargetValid(ui.hover)) {
+          const [c, r] = E.unkey(ui.hover);
+          el('rect', { x: cx(c) + 2, y: cy(r) + 2, width: S - 4, height: S - 4, rx: 3, class: 'trap-preview' }, ov);
+        }
+      } else if (ui.mode === 'torment') {
+        for (const id of E.tormentTargets(game)) marker(ov, 'target ability', ...mid(...E.entity(game, id).pos));
       } else {
         for (const t of E.turnTargets(game)) marker(ov, 'target', ...mid(...E.entity(game, t.id).pos));
       }
     }
     drawHover(ov);
+  }
+
+  function cellTargetValid(k) {
+    const [c, r] = E.unkey(k);
+    return E.abilityTargets(game).some((x) => Array.isArray(x) && x[0] === c && x[1] === r);
   }
 
   function drawHover(ov) {
@@ -227,6 +250,8 @@
       el('circle', { r: 11.5, class: 'token' }, g);
       el('text', { y: 0.5, class: 'token-label' }, g, e.label);
       if (e.swallowing) el('circle', { r: 4, cx: 9, cy: -9, class: 'mark' }, g);
+      const st = [e.blinded && 'blind', e.rooted && 'root', e.hunted && 'hunt'].filter(Boolean);
+      st.forEach((k, i) => el('circle', { r: 3.5, cx: -10 + i * 7, cy: -11, class: 'st-dot ' + k }, g));
       const w = 20, frac = e.hp / e.maxHp;
       el('rect', { x: -w / 2, y: 13, width: w, height: 3, rx: 1.5, class: 'hp-bg' }, g);
       el('rect', { x: -w / 2, y: 13, width: w * frac, height: 3, rx: 1.5, class: 'hp' + (frac <= 0.3 ? ' low' : '') }, g);
@@ -296,6 +321,29 @@
     }).join('')}</ul>`);
   }
 
+  function abilityButton(e) {
+    const ab = e.ability;
+    if (ab && ab.id === 'torment') {
+      const n = E.tormentTargets(game).length;
+      return `<button class="btn ${ui.mode === 'torment' ? 'on' : ''}" data-action="toggle-torment" ${n ? '' : 'disabled'}>
+        ${ui.mode === 'torment' ? 'Отмена: ' : ''}${esc(ab.name)} <small>(1 чистого любому врагу, ход закончится)</small></button>`;
+    }
+    if (!ab || ab.kind !== 'active') return '';
+    if (ab.pending) return `<button class="btn" disabled>${esc(ab.name)} <small>(ждёт уточнения правил)</small></button>`;
+    const targets = E.abilityTargets(game);
+    const st = { ready: 'заряжена', active: 'активна', spent: 'разряжена' }[e.abilityState];
+    if (ab.target === 'self') {
+      return `<button class="btn" data-action="ability-self" ${targets.length ? '' : 'disabled'}>${esc(ab.name)} <small>(${st})</small></button>`;
+    }
+    if (ab.target === 'allyDead') {
+      if (!targets.length) return `<button class="btn" disabled>${esc(ab.name)} <small>(${st}${e.abilityState === 'ready' ? ', погибших нет' : ''})</small></button>`;
+      return `<div class="slot-picks"><span class="hint">${esc(ab.name)}:</span>${targets.map((id) => `<button class="mini" data-action="ability-dead" data-id="${id}">${esc(E.entity(game, id).name)}</button>`).join('')}</div>`;
+    }
+    const label = ab.id === 'fireTrap' && e.abilityState === 'active' ? 'переставить метку' : st;
+    return `<button class="btn ${ui.mode === 'ability' ? 'on' : ''}" data-action="toggle-ability" ${targets.length ? '' : 'disabled'}>
+      ${ui.mode === 'ability' ? 'Отмена: ' : ''}${esc(ab.name)} <small>(${label}${e.abilityState === 'ready' && !targets.length ? ', нет целей' : ''})</small></button>`;
+  }
+
   function renderTurn() {
     const ph = game.phase;
     if (ph === 'pick') {
@@ -309,7 +357,7 @@
       return card(`Выбирает Игрок ${p}`, `
         <div class="faction-picks">${[1, 2, 3, 4].map((f) => `
           <button class="fpick f${f}" data-action="pick-faction" data-f="${f}" ${taken.includes(f) ? 'disabled' : ''}>
-            <span class="emb">${Screen.EMBLEMS[F[f].key]}</span><b>${esc(F[f].name)}</b><small>${F[f].test ? 'тестовая' : 'карты готовы'}</small></button>`).join('')}
+            <span class="emb">${Screen.EMBLEMS[F[f].key]}</span><b>${esc(F[f].name)}</b><small>${esc(F[f].hero.name)}</small></button>`).join('')}
         </div>
         <p class="hint">Наведите на фракцию — ниже откроется её ширма.</p>
         <div class="actions"><button class="btn" data-action="random-factions">Остальным случайно</button></div>`);
@@ -343,11 +391,22 @@
         <div class="actions"><button class="btn" data-action="auto-deploy">Остальных автоматически</button></div>`);
     }
     if (ph === 'battle') {
-      if (game.pending && game.pending.type === 'return') {
-        const g = E.entity(game, game.pending.golem), t = E.entity(game, game.pending.target);
-        return card('Возврат проглоченного', `
-          <div class="who">${chip(g.faction, g.label)}<div><strong>${esc(ename(g))}</strong><small>возвращает ${esc(ename(t))}</small></div></div>
-          <p class="hint">Выберите одну из ближайших свободных клеток (подсвечены). Затем цель бросает к30 за инициативу.</p>`, 'turn-card f' + g.faction);
+      if (game.pending && game.pending.type === 'place') {
+        const p = game.pending;
+        const g = E.entity(game, p.source), t = E.entity(game, p.target);
+        const what = { swallowReturn: 'возвращает проглоченного', hellGate: 'Адские врата', rebirth: 'Перерождение' }[p.reason];
+        return card('Выбор клетки', `
+          <div class="who">${chip(g.faction, g.label)}<div><strong>${esc(ename(g))}</strong><small>${what}: ${esc(ename(t))}</small></div></div>
+          <p class="hint">Кликните одну из ближайших свободных клеток (подсвечены).${p.reason !== 'hellGate' ? ' Затем юнит бросает к30 за инициативу.' : ''}</p>`, 'turn-card f' + g.faction);
+      }
+      if (game.pending && game.pending.type === 'swap') {
+        const p = game.pending;
+        const f = E.seatOf(game, p.seat).faction;
+        const units = E.swapCandidates(game, p.seat).map((id) => E.entity(game, id));
+        return card('Конец круга: Демоны', `
+          <p class="hint">Можно поменять местами на колесе двух своих юнитов. Выберите двоих или пропустите.</p>
+          <div class="slot-picks">${units.map((u) => `<button class="mini ${ui.swapPick.includes(u.id) ? 'strong' : ''}" data-action="swap-pick" data-id="${u.id}">${esc(u.name)} · ${u.slot}</button>`).join('')}</div>
+          <div class="actions"><button class="btn primary" data-action="swap-do" ${ui.swapPick.length === 2 ? '' : 'disabled'}>Поменять</button><button class="btn" data-action="swap-skip">Не менять</button></div>`, 'turn-card f' + f);
       }
       if (game.pendingInit) {
         const t = E.entity(game, game.pendingInit.entity), p = game.pendingInit;
@@ -361,20 +420,18 @@
       let hint, state = '', abilityBtn = '';
       if (e.kind === 'hero') {
         hint = 'Ход героя: магазин или действие (способность героя, активный предмет). Магазин и предметы пока не сделаны. Можно сдвинуться по колесу (бездействие) или закончить ход.';
+        abilityBtn = abilityButton(e);
       } else {
         const parts = [];
         if (E.canMove(game)) parts.push(`движение: ${t.mpLeft} из ${e.speed}${e.flying ? ' (летает)' : ''}`);
         else parts.push(t.acted ? 'действие сделано' : 'движение потрачено');
         if (E.canAttack(game)) parts.push(E.turnTargets(game).length ? 'есть цели для атаки' : 'целей для атаки нет');
-        parts.push(E.canShift(game) ? `сдвиг по колесу на 1…${e.init}` : 'сдвиг недоступен: юнит двигался');
-        state = `<p class="state">${parts.join(' · ')}</p>`;
+        parts.push(E.canShift(game) ? `сдвиг по колесу на 1…${e.init}` : 'сдвиг недоступен');
         hint = 'Наведите на клетку — путь, клик — пойти. Цели атаки в прицеле. Сдвиг — клик по месту на колесе.';
-        if (e.ability && e.ability.kind === 'active') {
-          const targets = E.abilityTargets(game);
-          const st = { ready: 'заряжена', active: 'активна', spent: 'разряжена' }[e.abilityState];
-          abilityBtn = `<button class="btn ${ui.mode === 'ability' ? 'on' : ''}" data-action="toggle-ability" ${targets.length ? '' : 'disabled'}>
-            ${ui.mode === 'ability' ? 'Отмена: ' : ''}${esc(e.ability.name)} <small>(${st}${e.abilityState === 'ready' && !targets.length ? ', нет целей рядом' : ''})</small></button>`;
-        }
+        abilityBtn = abilityButton(e);
+        if (e.blinded) parts.unshift('ослеплён: не атакует и не меняет инициативу');
+        if (e.rooted) parts.unshift('опутан: не двигается и не меняет инициативу');
+        state = `<p class="state">${parts.join(' · ')}</p>`;
       }
       return card(`Круг ${game.round} · место ${game.pointer}`, `
         <div class="who big">${chip(e.faction, e.label)}<div><strong>${esc(ename(e))}</strong><small>Игрок ${e.seat}</small></div>${hpBar(e)}</div>
@@ -513,9 +570,10 @@
       } else if (ev.type === 'roll' && (ev.purpose === 'attack' || ev.purpose === 'counter')) {
         items.push({
           sides: 6, value: ev.value, cls: 'f' + who.faction,
-          caption: (ev.purpose === 'attack' ? 'Атака · ' : 'Отпор · ') + esc(ename(who)),
+          caption: (ev.purpose === 'attack' ? 'Атака · ' : 'Отпор · ') + esc(ename(who)) + (ev.max ? ' · максимум' : ''),
           note: `${ev.value} + ${ev.mod}${ev.penalty ? ' − ' + ev.penalty : ''} = <b>${ev.total}</b>`,
         });
+        if (ev.max) lines.push(`<b class="maxdmg">Максимальный урон</b>: ${esc(ev.max)}`);
       } else if (ev.type === 'roll' && ev.purpose === 'counterCheck') {
         items.push({ sides: 6, value: ev.value, cls: 'f' + who.faction, caption: 'Отпор? нужно 4–6', note: ev.success ? '<b>да</b>' : 'нет', good: ev.success });
       } else if (ev.type === 'damage') {
@@ -544,6 +602,23 @@
         lines.push(`Ход окончен (${ev.reason})`);
       } else if (ev.type === 'shift') {
         lines.push(`${esc(ename(who))}: инициатива ${ev.from} → ${ev.to}${ev.to > ev.from ? ' — ещё ход в этом круге' : ''}`);
+      } else if (ev.type === 'status') {
+        const n = { blinded: 'ослеплён до конца своего хода', rooted: 'опутан до конца своего хода', hunted: 'помечен Адской охотой' }[ev.status];
+        lines.push(`${esc(ename(who))} ${n}`);
+      } else if (ev.type === 'statusEnd') {
+        lines.push(`${esc(ename(who))}: метка спадает`);
+      } else if (ev.type === 'trap') {
+        lines.push(`Огненная ловушка ${ev.moved ? 'переставлена' : 'поставлена'} на ${E.cellName(...ev.cell)}`);
+      } else if (ev.type === 'trapFired') {
+        lines.push(`<b>Огненная ловушка!</b> ${esc(ename(who))} наступил на ${E.cellName(...ev.cell)}`);
+      } else if (ev.type === 'teleport') {
+        lines.push(`${esc(ename(who))} появляется на ${E.cellName(...ev.cell)}`);
+      } else if (ev.type === 'revived') {
+        lines.push(`<b>${esc(ename(who))} воскрешён</b> на ${E.cellName(...ev.cell)}`);
+      } else if (ev.type === 'recharge') {
+        lines.push(`${esc(ename(who))}: способность перезаряжена (${esc(ev.source)})`);
+      } else if (ev.type === 'swap') {
+        lines.push(`${esc(ename(E.entity(game, ev.a)))} и ${esc(ename(E.entity(game, ev.b)))} поменялись местами на колесе`);
       } else if (ev.type === 'text') {
         lines.push(esc(ev.text));
       }
@@ -576,9 +651,11 @@
     const k = E.key(c, r);
     if (game.phase === 'deploy') return act(() => E.deploy(game, c, r));
     if (game.phase !== 'battle') return;
-    if (game.pending && game.pending.type === 'return') return act(() => E.chooseReturnCell(game, c, r));
+    if (game.pending && game.pending.type === 'place') return act(() => E.choosePlace(game, c, r));
     const there = E.unitAt(game, c, r);
+    if (ui.mode === 'ability' && cellTargetValid(k)) return act(() => E.useAbility(game, [c, r]));
     if (there && ui.mode === 'ability' && E.abilityTargets(game).includes(there.id)) return act(() => E.useAbility(game, there.id));
+    if (there && ui.mode === 'torment' && E.tormentTargets(game).includes(there.id)) return act(() => E.torment(game, there.id));
     if (there && ui.mode === 'attack' && E.turnTargets(game).some((t) => t.id === there.id)) return act(() => E.attack(game, there.id));
     const reach = E.turnReach(game);
     if (reach && reach.cells.has(k)) {
@@ -672,6 +749,16 @@
     if (a === 'undo-move') { E.undoMove(game); return render(); }
     if (a === 'end-turn') return act(() => E.endTurn(game));
     if (a === 'toggle-ability') { ui.mode = ui.mode === 'ability' ? 'attack' : 'ability'; return render(); }
+    if (a === 'toggle-torment') { ui.mode = ui.mode === 'torment' ? 'attack' : 'torment'; return render(); }
+    if (a === 'ability-self') return act(() => E.useAbility(game, 'self'));
+    if (a === 'ability-dead') return act(() => E.useAbility(game, b.dataset.id));
+    if (a === 'swap-pick') {
+      const id = b.dataset.id;
+      ui.swapPick = ui.swapPick.includes(id) ? ui.swapPick.filter((x) => x !== id) : ui.swapPick.concat(id).slice(-2);
+      return renderPanel();
+    }
+    if (a === 'swap-do') { const [x, y] = ui.swapPick; ui.swapPick = []; return act(() => E.swapOnWheel(game, x, y)); }
+    if (a === 'swap-skip') { ui.swapPick = []; return act(() => E.skipSwap(game)); }
   });
 
   $panel.addEventListener('change', (ev) => {
