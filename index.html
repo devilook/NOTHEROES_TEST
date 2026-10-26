@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>НЕ ГЕРОИ</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+/* Layout: доска занимает всё место слева, справа — узкая панель штаба; на телефоне панель уходит под доску. */
+:root {
+  --bg: #e7e9e4;
+  --surface: #f7f8f5;
+  --board: #fbfbf8;
+  --grid: #d9ddd3;
+  --ink: #1f2420;
+  --muted: #6a716a;
+  --line: #cfd4ca;
+  --wall: #b23a2e;
+  --door: #1596a6;
+  --object: #73b35a;
+  --focus: #1f2420;
+  --p1: #d9480f; --p2: #1864ab; --p3: #c2255c; --p4: #5f3dc4;
+  --token-fg: #ffffff;
+  --f-display: "Unbounded", "Arial Black", system-ui, sans-serif;
+  --f-body: "Golos Text", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131614; --surface: #1b1f1c; --board: #1f2420; --grid: #2e3530; --ink: #e6e9e3;
+    --muted: #949c93; --line: #333b35; --wall: #e2604f; --door: #3cc6d6; --object: #8fd07a; --focus: #e6e9e3;
+    --p1: #ff8a4c; --p2: #5aaef5; --p3: #f06595; --p4: #a08bff; --token-fg: #111411;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131614; --surface: #1b1f1c; --board: #1f2420; --grid: #2e3530; --ink: #e6e9e3;
+  --muted: #949c93; --line: #333b35; --wall: #e2604f; --door: #3cc6d6; --object: #8fd07a; --focus: #e6e9e3;
+  --p1: #ff8a4c; --p2: #5aaef5; --p3: #f06595; --p4: #a08bff; --token-fg: #111411;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 var(--f-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 12px 20px;
+}
+.p1 { --pc: var(--p1); } .p2 { --pc: var(--p2); } .p3 { --pc: var(--p3); } .p4 { --pc: var(--p4); }
+
+header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+h1 { font: 800 22px/1 var(--f-display); letter-spacing: .02em; margin: 0; }
+h1 span { color: var(--wall); }
+.sub { color: var(--muted); font-size: 13px; }
+.phase {
+  margin-left: auto; font: 500 12px/1 var(--f-mono); text-transform: uppercase; letter-spacing: .06em;
+  padding: 7px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+}
+.phase[class*=" p"] { border-color: var(--pc); color: var(--pc); }
+
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+
+.board-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px; min-width: 0; }
+#board { display: block; width: 100%; height: auto; max-height: calc(100vh - 90px); touch-action: manipulation; user-select: none; cursor: pointer; }
+
+/* Карта */
+.floor { fill: var(--board); }
+.grid { stroke: var(--grid); stroke-width: 1; fill: none; }
+.zone { fill: var(--pc); fill-opacity: .14; }
+.zone-num { fill: var(--pc); fill-opacity: .35; font: 800 54px var(--f-display); text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.coord { fill: var(--muted); font: 500 10px var(--f-mono); text-anchor: middle; dominant-baseline: central; }
+.coord.row { text-anchor: end; }
+.object { stroke: var(--object); stroke-width: 3; stroke-linecap: round; fill: none; }
+.block { fill: var(--wall); fill-opacity: .25; }
+.wall { stroke: var(--wall); stroke-width: 5; stroke-linecap: square; fill: none; }
+.door { stroke: var(--door); stroke-width: 5; stroke-linecap: butt; fill: none; }
+
+/* Подсветки */
+.place-target { fill: none; stroke: var(--pc); stroke-width: 2; stroke-dasharray: 4 3; }
+.reach { fill: var(--pc); fill-opacity: .22; }
+.reach.foreign { fill-opacity: .1; stroke: var(--pc); stroke-opacity: .5; stroke-dasharray: 3 3; }
+.reach-num { fill: var(--muted); font: 500 8px var(--f-mono); text-anchor: end; pointer-events: none; }
+.path { fill: none; stroke: var(--pc); stroke-width: 4; stroke-linejoin: round; stroke-linecap: round; }
+.path-dot { fill: var(--pc); }
+.path-end { fill: var(--board); stroke: var(--pc); stroke-width: 3; }
+.path-label { fill: var(--ink); font: 600 11px var(--f-mono); text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.hover { fill: none; stroke: var(--ink); stroke-opacity: .45; stroke-width: 1.5; pointer-events: none; }
+
+/* Фишки */
+.unit { pointer-events: none; }
+.token { fill: var(--pc); stroke: var(--board); stroke-width: 2.5; }
+.token-label { fill: var(--token-fg); font: 600 12px var(--f-body); text-anchor: middle; dominant-baseline: central; }
+.unit.spent { opacity: .45; }
+.sel-ring { fill: none; stroke: var(--ink); stroke-width: 2; stroke-dasharray: 3 3; }
+.mp-arc { fill: none; stroke: var(--pc); stroke-width: 2.5; stroke-linecap: round; opacity: .8; }
+.unit.selected .mp-arc { display: none; }
+
+/* Панель */
+#panel { display: grid; gap: 12px; min-width: 0; }
+section { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; gap: 10px; }
+h2 { margin: 0; font: 600 11px/1 var(--f-mono); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.hint { margin: 0; color: var(--muted); font-size: 13px; }
+ul, ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.chip {
+  display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--pc); color: var(--token-fg); font: 600 11px var(--f-body); flex: none;
+}
+.roster { display: grid; gap: 6px; }
+.roster-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.roster-head .mini { margin-left: auto; }
+.unit-row { display: flex; align-items: center; gap: 6px; }
+.unit-pick {
+  flex: 1; min-width: 0; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto auto; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: 8px; border: 1px solid transparent; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.unit-pick:hover { background: var(--bg); }
+.u-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.unit-row.is-selected .unit-pick { border-color: var(--ink); background: var(--bg); }
+.unit-row.off .u-cell { color: var(--muted); font-style: italic; }
+.u-move, .u-cell { font: 500 11px var(--f-mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.u-cell { color: var(--ink); min-width: 4.5em; text-align: right; }
+.mp { flex: none; width: 36px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.mp b { display: block; height: 100%; background: var(--ink); }
+.mp-num { flex: none; width: 3.2em; text-align: right; font: 500 11px var(--f-mono); font-variant-numeric: tabular-nums; }
+
+.toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.pill { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.pill input { accent-color: var(--pc); }
+.check { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+.check input { accent-color: var(--ink); }
+
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn {
+  flex: 1; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--board);
+  color: var(--ink); font: 600 13px var(--f-body); cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--ink); }
+.btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.btn.ghost { background: none; }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.mini {
+  padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line); background: none; color: var(--muted);
+  font: 500 11px var(--f-body); cursor: pointer;
+}
+.mini:hover { color: var(--ink); border-color: var(--ink); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.turn { display: flex; gap: 10px; align-items: center; }
+.turn .chip { width: 34px; height: 34px; font-size: 15px; }
+.turn strong { display: block; font: 600 16px/1.1 var(--f-display); color: var(--pc); }
+.turn small, .sel-box small { display: block; color: var(--muted); font-size: 12px; }
+.sel-box { display: flex; gap: 10px; align-items: center; padding: 10px; border-radius: 8px; background: var(--bg); }
+.sel-box > div { flex: 1; min-width: 0; }
+.num { font: 500 11px var(--f-mono); color: var(--muted); display: flex; align-items: center; gap: 4px; }
+.num input { width: 52px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--board); color: var(--ink); font: inherit; }
+
+.log { font-size: 12px; max-height: 220px; overflow: auto; }
+.log li { display: flex; gap: 8px; padding: 2px 0 2px 8px; border-left: 3px solid var(--pc, var(--line)); }
+.log span { font: 500 10px var(--f-mono); color: var(--muted); padding-top: 2px; }
+
+.toast { margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--ink); color: var(--surface); font-size: 13px; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>НЕ <span>ГЕРОИ</span></h1>
+  <span class="sub">прототип механики: расстановка и движение · карта «Эскиз v1» 28×22</span>
+  <span id="phase" class="phase">Расстановка</span>
+</header>
+<div class="layout">
+  <div class="board-wrap"><svg id="board" role="img" aria-label="Игровое поле"></svg></div>
+  <aside id="panel"></aside>
+</div>
+<script src="src/map.js"></script>
+<script src="src/engine.js"></script>
+<script src="src/ui.js"></script>
+</body>
+</html>
