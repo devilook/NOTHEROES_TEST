@@ -23,13 +23,15 @@ function dice(state, list) {
   };
 }
 
+// seats: [{ seat, faction }] — фракции назначаются сразу, партия начинается с фазы order.
 function newGame(seats, seed) {
-  return E.createGame(MAP, { seats: seats || [{ seat: 1, faction: 1 }, { seat: 2, faction: 3 }], rng: seeded(seed || 1) });
+  seats = seats || [{ seat: 1, faction: 1 }, { seat: 2, faction: 3 }];
+  return E.createGame(MAP, { seats: seats.map((x) => x.seat), factions: seats.map((x) => x.faction), rng: seeded(seed || 1) });
 }
 
 // Партия сразу в бою: все юниты убраны с поля, колесо пустое.
-function bareBattle() {
-  const s = newGame();
+function bareBattle(seats) {
+  const s = newGame(seats);
   E.rollOrder(s);
   E.autoInitiative(s);
   E.autoDeploy(s);
@@ -48,7 +50,7 @@ function put(s, id, c, r, slot) {
 
 function turnOf(s, id) {
   s.pointer = E.entity(s, id).slot - 1;
-  s.turn = null;
+  s.turn = { entity: null };
   // advance — внутренняя функция, доходим до нужного слота через endTurn
   s.phase = 'battle';
   E.endTurn(s);
@@ -63,7 +65,7 @@ test('карта: 28×22, 4 зоны по 9 клеток, 30 мест жетон
   assert.equal(m.tokenSpots.length, 30);
 });
 
-test('очерёдность: ничья по к6 перебрасывается, дальше по часовой', () => {
+test('очерёдность бросков к30: ничья по к6 перебрасывается, дальше по часовой', () => {
   const s = newGame([{ seat: 1, faction: 1 }, { seat: 2, faction: 2 }, { seat: 3, faction: 3 }]);
   dice(s, [[6, 5], [6, 5], [6, 2], [6, 1], [6, 6]]); // места 1 и 2 по 5 → переброс: 1 против 6
   const r = E.rollOrder(s);
@@ -152,11 +154,12 @@ test('жетон: встать можно, пройти насквозь нел�
   // Клетка сразу за жетоном не достигается через него
   const behind = reach.cells.get(E.key(13, 11));
   assert.ok(!behind || !behind.path.some(([c, r]) => c === 13 && r === 10));
-  s.tokens[E.key(13, 10)].content = 'gold';
+  s.tokens[E.key(13, 10)] = { kind: 'coins', value: 70 };
+  const coins = E.seatOf(s, 1).coins;
   const res = E.move(s, 13, 10);
   assert.ok(res.ok);
   assert.ok(!s.tokens[E.key(13, 10)]);
-  assert.equal(E.seatOf(s, 1).coins, E.TOKEN_GOLD);
+  assert.equal(E.seatOf(s, 1).coins, coins + 70);
   assert.equal(s.turn.entity, 's2u1', 'ход перешёл дальше');
 });
 
@@ -230,4 +233,169 @@ test('сдвиг по колесу: нельзя после движения; в
   put(t, 's2u1', 20, 3, 1);
   turnOf(t, 's1u1');
   assert.deepEqual(E.shiftOptions(t), [26, 27, 28, 30]);
+});
+
+// ---------- Присылка 5: выбор фракций, жетоны, Нечисть ----------
+
+test('выбор фракций: к6 определяет, кто выбирает первым; дальше по часовой', () => {
+  const s = E.createGame(MAP, { seats: [1, 3, 4], rng: seeded(3) });
+  assert.equal(s.phase, 'pick');
+  dice(s, [[6, 2], [6, 6], [6, 1]]); // зона 3 выигрывает
+  E.rollPickOrder(s);
+  assert.deepEqual(s.pickOrder, [3, 4, 1]);
+  assert.equal(E.picker(s), 3);
+  assert.ok(E.pickFaction(s, 4).ok);
+  assert.ok(!E.pickFaction(s, 4).ok, 'занятую фракцию взять нельзя');
+  E.pickFaction(s, 2);
+  E.pickFaction(s, 1);
+  assert.equal(s.phase, 'order');
+  assert.equal(E.seatOf(s, 3).faction, 4);
+  assert.equal(E.entity(s, 's3u1').name, 'Скелет');
+  assert.equal(E.seatOf(s, 3).coins, 20, 'стартовые монеты героя');
+});
+
+test('случайные фракции: у всех разные, можно вместо броска', () => {
+  const s = E.createGame(MAP, { seats: [1, 2, 3, 4], rng: seeded(9) });
+  assert.ok(E.randomFactions(s).ok);
+  assert.equal(s.phase, 'order');
+  assert.deepEqual(s.seats.map((x) => x.faction).sort(), [1, 2, 3, 4]);
+  assert.equal(s.entities.length, 24);
+});
+
+test('порядок к30: победитель к6 бросает первым за юнита 1, потом по часовой; герои последними', () => {
+  const s = newGame([{ seat: 1, faction: 1 }, { seat: 3, faction: 2 }, { seat: 2, faction: 4 }]);
+  dice(s, [[6, 1], [6, 3], [6, 5]]); // зона 2 выигрывает
+  E.rollOrder(s);
+  assert.deepEqual(s.order, [2, 1, 3]);
+  assert.deepEqual(s.initQueue.slice(0, 4), ['s2u1', 's1u1', 's3u1', 's2u2']);
+  assert.deepEqual(s.initQueue.slice(-3), ['s2h', 's1h', 's3h']);
+});
+
+test('жетоны: 15 монет нужных номиналов, 5 ловушек, 10 предметов', () => {
+  const s = newGame();
+  const all = Object.values(s.tokens);
+  assert.equal(all.length, 30);
+  assert.deepEqual(all.filter((t) => t.kind === 'coins').map((t) => t.value).sort((a, b) => a - b), E.TOKEN_COINS);
+  assert.equal(all.filter((t) => t.kind === 'trap').length, 5);
+  assert.equal(all.filter((t) => t.kind === 'item').length, 10);
+});
+
+const UNDEAD_VS_TEST = [{ seat: 1, faction: 4 }, { seat: 2, faction: 3 }];
+
+test('Нечисть: параметры с ширмы', () => {
+  const s = newGame(UNDEAD_VS_TEST);
+  const [sk, va, gh, sc, go] = [1, 2, 3, 4, 5].map((n) => E.entity(s, 's1u' + n));
+  assert.deepEqual([sk.hp, sk.atk, sk.armor, sk.counter, sk.speed, sk.init], [24, 0, 1, '=', 5, 4]);
+  assert.deepEqual([va.hp, va.atk, va.armor, va.counter, va.speed, va.flying, va.init], [25, 2, 0, '+', 5, true, 1]);
+  assert.deepEqual([gh.hp, gh.atk, gh.armor, gh.counter, gh.speed, gh.flying, gh.init], [20, 1, 0, 'x', 4, true, 2]);
+  assert.deepEqual([sc.hp, sc.atk, sc.atkType, sc.range, sc.armor, sc.counter, sc.speed, sc.init], [25, 1, 'ranged', 4, 2, 'x', 4, 2]);
+  assert.deepEqual([go.hp, go.atk, go.armor, go.counter, go.speed, go.init], [50, 2, 0, 'x', 3, 3]);
+  assert.equal(E.entity(s, 's1h').init, 3);
+});
+
+test('Скарабей: дальняя атака на 4 клетки, Призрак не даёт штрафа; Острый панцирь бьёт ближника', () => {
+  const s = bareBattle(UNDEAD_VS_TEST);
+  const sc = put(s, 's1u4', 3, 18, 5);
+  put(s, 's1u3', 4, 18, 6);   // Призрак на линии
+  const enemy = put(s, 's2u1', 7, 18, 9);
+  turnOf(s, 's1u4');
+  const t = E.turnTargets(s).find((x) => x.id === 's2u1');
+  assert.ok(t);
+  assert.equal(t.penalty, 0, 'Призрак не преграда');
+  dice(s, [[6, 4]]);
+  E.attack(s, 's2u1');
+  assert.equal(enemy.hp, 10 - (4 + 1 - 1));
+
+  const s2 = bareBattle(UNDEAD_VS_TEST);
+  const sc2 = put(s2, 's1u4', 3, 18, 9);
+  const m = put(s2, 's2u1', 4, 18, 5);
+  turnOf(s2, 's2u1');
+  dice(s2, [[6, 6]]);
+  E.attack(s2, 's1u4');
+  assert.equal(sc2.hp, 25 - (6 + 1 - 2));
+  assert.equal(m.hp, 10 - 2, 'атакующий получил 2 чистого урона');
+});
+
+test('Призрак: на 1, 3, 5 урона нет; Вампир лечится за атаку', () => {
+  const s = bareBattle(UNDEAD_VS_TEST);
+  const gh = put(s, 's1u3', 3, 18, 9);
+  put(s, 's2u1', 4, 18, 5);
+  turnOf(s, 's2u1');
+  dice(s, [[6, 5]]);
+  E.attack(s, 's1u3');
+  assert.equal(gh.hp, 20);
+
+  const s2 = bareBattle(UNDEAD_VS_TEST);
+  const va = put(s2, 's1u2', 3, 18, 5);
+  va.hp = 20;
+  const d = put(s2, 's2u1', 4, 18, 9);
+  turnOf(s2, 's1u2');
+  dice(s2, [[6, 3], [6, 1]]); // атака 3; проверка отпора 1 — нет
+  E.attack(s2, 's2u1');
+  assert.equal(d.hp, 10 - (3 + 2 - 1));
+  assert.equal(va.hp, 21);
+});
+
+test('Скелет не получает чистый урон; Собиратель останков: +50 за погибшего юнита', () => {
+  const s = bareBattle(UNDEAD_VS_TEST);
+  put(s, 's1u5', 3, 18, 5);
+  const skel = put(s, 's1u1', 4, 18, 9);
+  turnOf(s, 's1u5');
+  E.useAbility(s, 's1u1');
+  assert.equal(skel.hp, 24, 'чистый урон Проглатывания по Скелету не проходит');
+
+  const s2 = bareBattle([{ seat: 1, faction: 3 }, { seat: 2, faction: 4 }]);
+  put(s2, 's1u1', 3, 18, 5);
+  const gh = put(s2, 's2u3', 4, 18, 9);
+  put(s2, 's2u1', 20, 3, 12);
+  gh.hp = 2;
+  turnOf(s2, 's1u1');
+  const coins = E.seatOf(s2, 2).coins;
+  dice(s2, [[6, 6]]);
+  E.attack(s2, 's2u3');
+  assert.ok(!gh.alive);
+  assert.equal(E.seatOf(s2, 2).coins, coins + 50);
+});
+
+test('Мясной голем: проглатывает, возвращает в конце следующего хода, цель бросает к30', () => {
+  const s = bareBattle(UNDEAD_VS_TEST);
+  const g = put(s, 's1u5', 3, 18, 5);
+  const t = put(s, 's2u1', 4, 19, 9); // по диагонали
+  put(s, 's2u2', 20, 3, 12);
+  turnOf(s, 's1u5');
+  assert.ok(E.abilityTargets(s).includes('s2u1'));
+  const r = E.useAbility(s, 's2u1');
+  assert.ok(r.ok);
+  assert.equal(t.hp, 10 - 3);
+  assert.equal(t.pos, null);
+  assert.equal(s.wheel[9], null);
+  assert.equal(g.abilityState, 'active');
+  E.endTurn(s);                 // конец хода, где способность применена
+  assert.equal(s.turn.entity, 's2u2');
+  E.endTurn(s);                 // круг 2: снова голем
+  assert.equal(s.turn.entity, 's1u5');
+  E.move(s, 3, 17);
+  dice(s, [[30, 15]]);
+  const end = E.endTurn(s);     // конец следующего хода — возврат
+  assert.ok(end.ok);
+  if (s.pending) E.chooseReturnCell(s, ...s.pending.options[0]);
+  assert.ok(t.pos, 'цель вернулась на поле');
+  assert.equal(Math.abs(t.pos[0] - 3) + Math.abs(t.pos[1] - 17), 1, 'на ближайшую свободную клетку');
+  if (s.pendingInit) E.chooseInitiative(s, 15);
+  assert.equal(t.slot, 15);
+  assert.equal(g.abilityState, 'spent');
+  assert.ok(s.turn, 'бой продолжается');
+});
+
+test('Нечисть: в конце круга +2 здоровья, не выше максимума', () => {
+  const s = bareBattle(UNDEAD_VS_TEST);
+  const sk = put(s, 's1u1', 3, 18, 5);
+  const va = put(s, 's1u2', 5, 18, 6);
+  sk.hp = 10; va.hp = 24;
+  put(s, 's2u1', 20, 3, 12);
+  turnOf(s, 's2u1');
+  E.endTurn(s);
+  assert.equal(s.round, 2);
+  assert.equal(sk.hp, 12);
+  assert.equal(va.hp, 25);
 });

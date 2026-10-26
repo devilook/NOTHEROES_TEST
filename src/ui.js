@@ -1,4 +1,4 @@
-// Интерфейс прототипа: поле (SVG), колесо инициативы, лоток кубиков и панель хода.
+// Интерфейс прототипа: поле (SVG), колесо инициативы, лоток кубиков, панель хода и ширма.
 // Вся логика — в engine.js; здесь только показ и ввод.
 (function () {
   'use strict';
@@ -6,6 +6,7 @@
   const MAP = window.NHMap;
   const Dice = window.NHDice;
   const Wheel = window.NHWheel;
+  const Screen = window.NHScreen;
 
   const S = 32;             // размер клетки в единицах viewBox
   const OX = 26, OY = 22;   // поля под координаты
@@ -14,12 +15,15 @@
   const F = E.FACTIONS;
 
   const ui = {
-    lobby: { 1: 1, 2: 2, 3: 3, 4: 4 },   // зона → фракция (0 — пусто)
+    lobby: { 1: true, 2: true, 3: true, 4: true }, // зоны с игроками
     busy: false,
     hover: null,      // ключ клетки под курсором
     preview: null,    // ключ клетки, путь до которой показан
     anim: null,       // { entity, path, start }
     hoverSlot: null,
+    mode: 'attack',   // 'attack' | 'ability' — что делает клик по юниту
+    screenSeat: null, // чья ширма открыта (null — того, кто сейчас действует)
+    previewFaction: 4,
     message: '',
   };
   let game = null;
@@ -31,6 +35,8 @@
   const $tray = document.getElementById('tray');
   const $panel = document.getElementById('panel');
   const $phase = document.getElementById('phase');
+  const $screen = document.getElementById('screen');
+  const $tabs = document.getElementById('screen-tabs');
 
   // ---------- Утилиты ----------
 
@@ -40,7 +46,9 @@
   const map = () => (game ? game.map : staticMap);
   const fname = (f) => F[f].name;
   const ename = (e) => E.entityName(game, e);
+  const sname = (n) => E.seatName(game, n);
   const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+  const seatCls = (n) => { const s = game && E.seatOf(game, n); return s && s.faction ? 'f' + s.faction : 'f0'; };
 
   function el(tag, attrs, parent, text) {
     const n = document.createElementNS(NS, tag);
@@ -60,12 +68,24 @@
     return [c, r];
   }
 
-  function zoneFaction(z) {
+  function zoneClass(z) {
     if (game) {
       const s = game.seats.find((x) => x.zone === z);
-      return s ? s.faction : 0;
+      return s ? (s.faction ? 'f' + s.faction : 'taken') : 'empty';
     }
-    return ui.lobby[z] || 0;
+    return ui.lobby[z] ? 'taken' : 'empty';
+  }
+
+  // Кто сейчас действует (для подсветки и ширмы).
+  function actor() {
+    if (!game) return null;
+    if (game.phase === 'factions') return { seat: E.picker(game) };
+    if (game.pendingInit) return E.entity(game, game.pendingInit.entity);
+    if (game.pending) return E.entity(game, game.pending.golem);
+    if (game.phase === 'initiative') return E.initCurrent(game);
+    if (game.phase === 'deploy') return E.deployCurrent(game);
+    if (game.phase === 'battle') return E.current(game);
+    return null;
   }
 
   // ---------- Поле: статичный слой ----------
@@ -78,12 +98,12 @@
     el('rect', { x: OX, y: OY, width: m.cols * S, height: m.rows * S, class: 'floor' }, g);
 
     for (const z of [1, 2, 3, 4]) {
-      const f = zoneFaction(z);
+      const zc = zoneClass(z);
       const cells = m.zones[z];
-      for (const [c, r] of cells) el('rect', { x: cx(c), y: cy(r), width: S, height: S, class: 'zone ' + (f ? 'f' + f : 'empty') }, g);
+      for (const [c, r] of cells) el('rect', { x: cx(c), y: cy(r), width: S, height: S, class: 'zone ' + zc }, g);
       const xs = cells.map((p) => p[0]), ys = cells.map((p) => p[1]);
-      const zc = (Math.min(...xs) + Math.max(...xs) + 1) / 2, zr = (Math.min(...ys) + Math.max(...ys) + 1) / 2;
-      el('text', { x: OX + zc * S, y: OY + zr * S, class: 'zone-num ' + (f ? 'f' + f : 'empty') }, g, z);
+      const mx = (Math.min(...xs) + Math.max(...xs) + 1) / 2, my = (Math.min(...ys) + Math.max(...ys) + 1) / 2;
+      el('text', { x: OX + mx * S, y: OY + my * S, class: 'zone-num ' + zc }, g, z);
     }
 
     let d = '';
@@ -123,6 +143,12 @@
     }
   }
 
+  function marker(ov, cls, x, y) {
+    const g = el('g', { class: cls, transform: `translate(${x} ${y})` }, ov);
+    el('circle', { r: 15 }, g);
+    el('path', { d: 'M0 -19V-12M0 12V19M-19 0H-12M12 0H19' }, g);
+  }
+
   function drawOverlay() {
     const ov = document.getElementById('overlay');
     ov.innerHTML = '';
@@ -130,12 +156,17 @@
 
     if (game.phase === 'deploy') {
       const e = E.deployCurrent(game);
-      for (const [c, r] of game.map.zones[e.seat]) {
+      for (const [c, r] of game.map.zones[E.seatOf(game, e.seat).zone]) {
         if (E.canDeploy(game, c, r)) el('rect', { x: cx(c) + 3, y: cy(r) + 3, width: S - 6, height: S - 6, rx: 4, class: 'place-target f' + e.faction }, ov);
       }
     }
 
-    if (game.phase === 'battle') {
+    if (game.phase === 'battle' && game.pending && game.pending.type === 'return') {
+      const g = E.entity(game, game.pending.golem);
+      for (const [c, r] of game.pending.options) el('rect', { x: cx(c) + 3, y: cy(r) + 3, width: S - 6, height: S - 6, rx: 4, class: 'place-target f' + g.faction }, ov);
+    }
+
+    if (game.phase === 'battle' && game.turn) {
       const cur = E.current(game);
       const reach = E.turnReach(game);
       if (reach) {
@@ -156,11 +187,10 @@
           el('text', { x, y: y + 1, class: 'path-label' }, ov, target.steps);
         }
       }
-      for (const t of E.turnTargets(game)) {
-        const [x, y] = mid(...E.entity(game, t.id).pos);
-        const g = el('g', { class: 'target', transform: `translate(${x} ${y})` }, ov);
-        el('circle', { r: 15 }, g);
-        el('path', { d: 'M0 -19V-12M0 12V19M-19 0H-12M12 0H19' }, g);
+      if (ui.mode === 'ability') {
+        for (const id of E.abilityTargets(game)) marker(ov, 'target ability', ...mid(...E.entity(game, id).pos));
+      } else {
+        for (const t of E.turnTargets(game)) marker(ov, 'target', ...mid(...E.entity(game, t.id).pos));
       }
     }
     drawHover(ov);
@@ -188,62 +218,51 @@
     layer.innerHTML = '';
     if (!game) return;
     const cur = game.phase === 'battle' && E.current(game);
-    const deploying = game.phase === 'deploy' && E.deployCurrent(game);
     for (const e of game.entities) {
       if (!e.alive || !e.pos) continue;
       const [x, y] = unitXY(e, now || performance.now());
       const active = cur && cur.id === e.id;
-      const g = el('g', { transform: `translate(${x} ${y})`, class: 'unit f' + e.faction + (active ? ' active' : '') }, layer);
+      const g = el('g', { transform: `translate(${x} ${y})`, class: 'unit f' + e.faction + (active ? ' active' : '') + (e.flying ? ' flying' : '') }, layer);
       if (active) el('circle', { r: 15.5, class: 'active-ring' }, g);
       el('circle', { r: 11.5, class: 'token' }, g);
       el('text', { y: 0.5, class: 'token-label' }, g, e.label);
-      // Полоска здоровья
+      if (e.swallowing) el('circle', { r: 4, cx: 9, cy: -9, class: 'mark' }, g);
       const w = 20, frac = e.hp / e.maxHp;
       el('rect', { x: -w / 2, y: 13, width: w, height: 3, rx: 1.5, class: 'hp-bg' }, g);
       el('rect', { x: -w / 2, y: 13, width: w * frac, height: 3, rx: 1.5, class: 'hp' + (frac <= 0.3 ? ' low' : '') }, g);
-    }
-    if (deploying) {
-      // Подсказка: кого ставим сейчас
-      $info.innerHTML = `Ставит: <b class="chip-text f${deploying.faction}">${esc(ename(deploying))}</b> · место ${deploying.slot} на колесе`;
     }
   }
 
   // ---------- Колесо ----------
 
   function renderWheel() {
-    if (!game) {
-      Wheel.draw($wheel, { wheel: new Array(31).fill(null) }, { title: 'Колесо', subtitle: 'инициативы' });
-      return;
-    }
+    if (!game) return Wheel.draw($wheel, { wheel: new Array(31).fill(null) }, { title: 'Колесо', subtitle: 'инициативы' });
     let options = [], pointer = null, title = '', subtitle = '';
+    if (game.pendingInit && !ui.busy) options = game.pendingInit.options;
     if (game.phase === 'initiative') {
       title = 'Инициатива';
       const e = E.initCurrent(game);
       subtitle = e ? ename(e) : '';
-      if (game.pendingInit) options = game.pendingInit.options;
     } else if (game.phase === 'deploy') {
       title = 'Расстановка';
     } else if (game.phase === 'battle') {
       pointer = game.pointer;
       title = 'Круг ' + game.round;
       subtitle = 'место ' + game.pointer;
-      if (!ui.busy) options = E.shiftOptions(game);
+      if (!ui.busy && !game.pendingInit) options = E.shiftOptions(game);
     } else if (game.phase === 'over') {
       title = 'Конец';
+    } else {
+      title = 'Колесо';
+      subtitle = 'инициативы';
     }
     Wheel.draw($wheel, game, { options, pointer, title, subtitle, hoverSlot: ui.hoverSlot });
   }
 
   // ---------- Панель ----------
 
-  function chip(f, label, extra) {
-    return `<span class="chip f${f} ${extra || ''}">${esc(label)}</span>`;
-  }
-
-  function statLine(e) {
-    if (e.kind === 'hero') return `инициатива ${e.init}`;
-    const cnt = { '+': '+ всегда', '=': '= 50/50', x: 'Х никогда' }[e.counter];
-    return `броня ${e.armor} · атака +${e.atk} ${e.atkType === 'melee' ? 'ближняя' : 'дальняя ' + e.range} · скорость ${e.speed}${e.flying ? ' (крыло)' : ''} · инициатива ${e.init} · отпор ${cnt}`;
+  function chip(f, label) {
+    return `<span class="chip f${f}">${esc(label)}</span>`;
   }
 
   function hpBar(e) {
@@ -251,56 +270,58 @@
     return `<div class="hpbar" title="Здоровье"><b style="width:${(100 * e.hp) / e.maxHp}%"></b></div><span class="hp-num">${e.hp}/${e.maxHp}</span>`;
   }
 
+  function card(title, body, cls) {
+    return `<section class="card ${cls || ''}"><h2 class="ribbon-h">${title}</h2>${body}</section>`;
+  }
+
   function renderLobby() {
-    const used = Object.values(ui.lobby).filter(Boolean);
-    const dup = used.length !== new Set(used).size;
-    const ok = used.length >= 2 && !dup;
-    return `<section class="card">
-      <h2>Новая партия</h2>
-      <p class="hint">Выберите фракцию для каждой стартовой зоны. Пустая зона — без игрока. Нужно минимум двое, фракции не повторяются.</p>
-      <div class="seats">${[1, 3, 4, 2].map((z) => `
-        <label class="seat ${ui.lobby[z] ? 'f' + ui.lobby[z] : ''}">
-          <span class="zone-tag">Зона ${z}</span>
-          <select id="lobby-z${z}" data-action="lobby" data-z="${z}">
-            <option value="0">— пусто —</option>
-            ${[1, 2, 3, 4].map((f) => `<option value="${f}" ${ui.lobby[z] === f ? 'selected' : ''}>${F[f].name} (${F[f].colorName})</option>`).join('')}
-          </select>
-        </label>`).join('')}
+    const n = Object.values(ui.lobby).filter(Boolean).length;
+    return card('Новая партия', `
+      <p class="hint">Отметьте стартовые зоны, где сидят игроки. Нужно минимум двое. Фракции выберете дальше.</p>
+      <div class="seats">${[3, 4, 1, 2].map((z) => `
+        <label class="seat ${ui.lobby[z] ? 'on' : ''}"><input type="checkbox" id="lobby-z${z}" data-action="lobby" data-z="${z}" ${ui.lobby[z] ? 'checked' : ''}>
+          <span>Игрок ${z}</span><small>зона ${z}</small></label>`).join('')}
       </div>
-      ${dup ? '<p class="warn">Одна фракция выбрана дважды.</p>' : ''}
-      <p class="hint">Тестовые параметры у всех юнитов: здоровье 10, броня 1, атака +1 (ближняя), скорость 5, инициатива 3, отпор «=». У героя — инициатива 3.</p>
-      <div class="actions"><button class="btn primary" data-action="start" ${ok ? '' : 'disabled'}>Начать партию</button></div>
-    </section>`;
+      <div class="actions"><button class="btn primary" data-action="start" ${n >= 2 ? '' : 'disabled'}>Начать партию</button></div>`);
   }
 
   function renderSeats() {
-    return `<section class="card">
-      <h2>Игроки</h2>
-      <ul class="seat-list">${(game.order.length ? game.order : game.seats.map((s) => s.seat)).map((sn, i) => {
-        const s = E.seatOf(game, sn);
-        const alive = game.entities.filter((e) => e.seat === sn && e.kind === 'unit' && e.alive).length;
-        return `<li class="${s.out ? 'out' : ''}">${game.order.length ? `<span class="ord">${i + 1}</span>` : ''}${chip(s.faction, F[s.faction].name[0])}
-          <span class="s-name">${fname(s.faction)}</span>
-          <span class="s-stat" title="Живых юнитов">${alive}/5</span>
-          <span class="s-stat" title="Монеты">${s.coins} мон.</span>
-          <span class="s-stat" title="Предметы">${s.items.length} пр.</span></li>`;
-      }).join('')}</ul>
-    </section>`;
+    const list = game.order.length ? game.order : game.pickOrder.length ? game.pickOrder : game.seats.map((s) => s.seat);
+    return card('Игроки', `<ul class="seat-list">${list.map((sn, i) => {
+      const s = E.seatOf(game, sn);
+      const alive = game.entities.filter((e) => e.seat === sn && e.kind === 'unit' && e.alive).length;
+      return `<li class="${s.out ? 'out' : ''} ${seatCls(sn)}"><span class="ord">${i + 1}</span>${s.faction ? chip(s.faction, F[s.faction].name[0]) : '<span class="chip f0">?</span>'}
+        <span class="s-name">Игрок ${sn}${s.faction ? ' · ' + esc(fname(s.faction)) : ''}</span>
+        ${s.faction ? `<span class="s-stat" title="Живых юнитов">${alive}/5</span><span class="s-stat gold" title="Монеты">${s.coins}</span>` : ''}</li>`;
+    }).join('')}</ul>`);
   }
 
   function renderTurn() {
     const ph = game.phase;
+    if (ph === 'pick') {
+      return card('Выбор фракций', `
+        <p class="hint">Все бросают к6: у кого больше, тот выбирает фракцию первым, дальше по часовой стрелке (зоны 1 → 3 → 4 → 2). Или раздайте фракции случайно.</p>
+        <div class="actions"><button class="btn primary" data-action="roll-pick">Бросить к6</button><button class="btn" data-action="random-factions">Случайно</button></div>`);
+    }
+    if (ph === 'factions') {
+      const p = E.picker(game);
+      const taken = E.takenFactions(game);
+      return card(`Выбирает Игрок ${p}`, `
+        <div class="faction-picks">${[1, 2, 3, 4].map((f) => `
+          <button class="fpick f${f}" data-action="pick-faction" data-f="${f}" ${taken.includes(f) ? 'disabled' : ''}>
+            <span class="emb">${Screen.EMBLEMS[F[f].key]}</span><b>${esc(F[f].name)}</b><small>${F[f].test ? 'тестовая' : 'карты готовы'}</small></button>`).join('')}
+        </div>
+        <p class="hint">Наведите на фракцию — ниже откроется её ширма.</p>
+        <div class="actions"><button class="btn" data-action="random-factions">Остальным случайно</button></div>`);
+    }
     if (ph === 'order') {
-      return `<section class="card">
-        <h2>Очерёдность</h2>
-        <p class="hint">Каждый игрок бросает к6. Больше всех — ходит первым, дальше по часовой стрелке (зоны 1 → 3 → 4 → 2). Ничья у лидеров — переброс.</p>
-        <div class="actions"><button class="btn primary" data-action="roll-order">Бросить к6</button></div>
-      </section>`;
+      return card('Порядок инициативы', `
+        <p class="hint">Новый бросок к6: победитель первым бросает к30 за своего юнита 1, дальше по часовой. Затем юниты 2, 3, 4, 5 и герои.</p>
+        <div class="actions"><button class="btn primary" data-action="roll-order">Бросить к6</button></div>`);
     }
     if (ph === 'initiative') {
       const e = E.initCurrent(game);
       const p = game.pendingInit;
-      const done = game.initIndex, total = game.initQueue.length;
       let body;
       if (!p) {
         body = `<p class="hint">Бросок к30 — исходное место. Затем можно сдвинуться на 1…${e.init} в любую сторону, только на свободное место и не через 30 | 1. Выпало 1 — любое свободное место. Выпало 30 или всё занято — последнее свободное место.</p>
@@ -311,89 +332,117 @@
           <div class="slot-picks">${p.options.map((s) => `<button class="mini ${s === p.value ? 'strong' : ''}" data-action="pick-slot" data-slot="${s}">${s}</button>`).join('')}</div>
           <div class="actions"><button class="btn" data-action="auto-init">Всех автоматически</button></div>`;
       }
-      return `<section class="card">
-        <h2>Инициатива · ${done + 1} из ${total}</h2>
-        <div class="who">${chip(e.faction, e.label)}<div><strong>${esc(ename(e))}</strong><small>${statLine(e)}</small></div></div>
-        ${body}
-      </section>`;
+      return card(`Инициатива · ${game.initIndex + 1} из ${game.initQueue.length}`, `
+        <div class="who">${chip(e.faction, e.label)}<div><strong>${esc(ename(e))}</strong><small>Игрок ${e.seat} · инициатива ${e.init}</small></div></div>${body}`);
     }
     if (ph === 'deploy') {
       const e = E.deployCurrent(game);
-      return `<section class="card">
-        <h2>Расстановка · ${game.deployIndex + 1} из ${game.deployQueue.length}</h2>
+      return card(`Расстановка · ${game.deployIndex + 1} из ${game.deployQueue.length}`, `
         <div class="who">${chip(e.faction, e.label)}<div><strong>${esc(ename(e))}</strong><small>место ${e.slot} на колесе</small></div></div>
-        <p class="hint">Юниты встают в порядке колеса. Кликните свободную клетку зоны ${E.seatOf(game, e.seat).zone}: она подсвечена.</p>
-        <div class="actions"><button class="btn" data-action="auto-deploy">Остальных автоматически</button></div>
-      </section>`;
+        <p class="hint">Юниты встают в порядке колеса. Кликните подсвеченную клетку зоны ${E.seatOf(game, e.seat).zone}.</p>
+        <div class="actions"><button class="btn" data-action="auto-deploy">Остальных автоматически</button></div>`);
     }
     if (ph === 'battle') {
+      if (game.pending && game.pending.type === 'return') {
+        const g = E.entity(game, game.pending.golem), t = E.entity(game, game.pending.target);
+        return card('Возврат проглоченного', `
+          <div class="who">${chip(g.faction, g.label)}<div><strong>${esc(ename(g))}</strong><small>возвращает ${esc(ename(t))}</small></div></div>
+          <p class="hint">Выберите одну из ближайших свободных клеток (подсвечены). Затем цель бросает к30 за инициативу.</p>`, 'turn-card f' + g.faction);
+      }
+      if (game.pendingInit) {
+        const t = E.entity(game, game.pendingInit.entity), p = game.pendingInit;
+        return card('Новая инициатива', `
+          <div class="who">${chip(t.faction, t.label)}<div><strong>${esc(ename(t))}</strong><small>к30 = ${p.value}</small></div></div>
+          <p class="hint">Выберите место на колесе.</p>
+          <div class="slot-picks">${p.options.map((s) => `<button class="mini ${s === p.value ? 'strong' : ''}" data-action="pick-slot" data-slot="${s}">${s}</button>`).join('')}</div>`, 'turn-card f' + t.faction);
+      }
       const e = E.current(game);
       const t = game.turn;
-      let hint, state = '';
+      let hint, state = '', abilityBtn = '';
       if (e.kind === 'hero') {
-        hint = 'Ход героя. Магазин и способности пока не сделаны. Можно сдвинуться по колесу (бездействие) или закончить ход.';
+        hint = 'Ход героя: магазин или действие (способность героя, активный предмет). Магазин и предметы пока не сделаны. Можно сдвинуться по колесу (бездействие) или закончить ход.';
       } else {
         const parts = [];
-        if (E.canMove(game)) parts.push(`движение: осталось ${t.mpLeft} из ${e.speed}`);
+        if (E.canMove(game)) parts.push(`движение: ${t.mpLeft} из ${e.speed}${e.flying ? ' (летает)' : ''}`);
         else parts.push(t.acted ? 'действие сделано' : 'движение потрачено');
-        if (E.canAttack(game)) parts.push(E.turnTargets(game).length ? 'есть цели для атаки' : 'целей рядом нет');
-        if (E.canShift(game)) parts.push(`можно сдвинуться по колесу на 1…${e.init}`);
-        else parts.push('сдвиг по колесу недоступен: юнит двигался');
+        if (E.canAttack(game)) parts.push(E.turnTargets(game).length ? 'есть цели для атаки' : 'целей для атаки нет');
+        parts.push(E.canShift(game) ? `сдвиг по колесу на 1…${e.init}` : 'сдвиг недоступен: юнит двигался');
         state = `<p class="state">${parts.join(' · ')}</p>`;
-        hint = 'Подсвечено, куда можно дойти: наведите на клетку, чтобы увидеть путь, кликните, чтобы пойти. Цели атаки обведены прицелом. Сдвиг — клик по подсвеченному месту на колесе.';
+        hint = 'Наведите на клетку — путь, клик — пойти. Цели атаки в прицеле. Сдвиг — клик по месту на колесе.';
+        if (e.ability && e.ability.kind === 'active') {
+          const targets = E.abilityTargets(game);
+          const st = { ready: 'заряжена', active: 'активна', spent: 'разряжена' }[e.abilityState];
+          abilityBtn = `<button class="btn ${ui.mode === 'ability' ? 'on' : ''}" data-action="toggle-ability" ${targets.length ? '' : 'disabled'}>
+            ${ui.mode === 'ability' ? 'Отмена: ' : ''}${esc(e.ability.name)} <small>(${st}${e.abilityState === 'ready' && !targets.length ? ', нет целей рядом' : ''})</small></button>`;
+        }
       }
-      return `<section class="card turn-card f${e.faction}">
-        <h2>Круг ${game.round} · место ${game.pointer}</h2>
-        <div class="who big">${chip(e.faction, e.label)}<div><strong>${esc(ename(e))}</strong><small>${statLine(e)}</small></div>${hpBar(e)}</div>
-        ${state}
-        <p class="hint">${hint}</p>
+      return card(`Круг ${game.round} · место ${game.pointer}`, `
+        <div class="who big">${chip(e.faction, e.label)}<div><strong>${esc(ename(e))}</strong><small>Игрок ${e.seat}</small></div>${hpBar(e)}</div>
+        ${state}<p class="hint">${hint}</p>
+        ${abilityBtn ? `<div class="actions">${abilityBtn}</div>` : ''}
         <div class="actions">
           ${e.kind === 'unit' ? `<button class="btn" data-action="undo-move" ${t.moved && !t.acted ? '' : 'disabled'}>Отменить движение</button>` : ''}
           <button class="btn primary" data-action="end-turn">Конец хода</button>
-        </div>
-      </section>`;
+        </div>`, 'turn-card f' + e.faction);
     }
     if (ph === 'over') {
-      const s = E.seatOf(game, game.winner);
-      return `<section class="card win ${s ? 'f' + s.faction : ''}">
-        <h2>Партия окончена</h2>
-        <p class="win-title">${s ? 'Победа: ' + esc(fname(s.faction)) : 'Ничья'}</p>
-        <div class="actions"><button class="btn primary" data-action="new">Новая партия</button></div>
-      </section>`;
+      return card('Партия окончена', `<p class="win-title">${game.winner ? 'Победа: ' + esc(sname(game.winner)) : 'Ничья'}</p>
+        <div class="actions"><button class="btn primary" data-action="new">Новая партия</button></div>`, 'win ' + seatCls(game.winner));
     }
     return '';
   }
 
   function renderLog() {
-    if (!game) return '';
-    return `<section class="card">
-      <h2>Журнал</h2>
-      <ol class="log">${game.log.slice(-40).reverse().map((l) => {
-        const s = l.seat && E.seatOf(game, l.seat);
-        return `<li class="${s ? 'f' + s.faction : ''}"><span>К${l.round}</span>${esc(l.text)}</li>`;
-      }).join('')}</ol>
-    </section>`;
+    return card('Журнал', `<ol class="log">${game.log.slice(-40).reverse().map((l) =>
+      `<li class="${l.seat ? seatCls(l.seat) : ''}"><span>К${l.round}</span>${esc(l.text)}</li>`).join('')}</ol>`);
   }
 
   function renderPanel() {
     const ph = game ? game.phase : 'lobby';
-    const titles = { lobby: 'Подготовка', order: 'Очерёдность', initiative: 'Инициатива', deploy: 'Расстановка', battle: 'Бой', over: 'Конец партии' };
-    $phase.textContent = ph === 'battle' ? `Круг ${game.round} · ${ename(E.current(game))}` : titles[ph];
-    $phase.className = 'phase' + (ph === 'battle' ? ' f' + E.current(game).faction : '');
+    const titles = { lobby: 'Подготовка', pick: 'Выбор фракций', factions: 'Выбор фракций', order: 'Порядок инициативы', initiative: 'Инициатива', deploy: 'Расстановка', battle: 'Бой', over: 'Конец партии' };
+    const cur = ph === 'battle' && E.current(game);
+    $phase.textContent = cur ? `Круг ${game.round} · ${ename(cur)}` : titles[ph];
+    $phase.className = 'phase' + (cur ? ' f' + cur.faction : '');
     let html = game ? renderTurn() + renderSeats() + renderLog() : renderLobby();
     if (game && game.phase !== 'over') html += `<section class="card quiet"><button class="btn ghost" data-action="new">Сбросить партию</button></section>`;
     if (ui.message) html = `<p class="toast" role="status">${esc(ui.message)}</p>` + html;
     $panel.innerHTML = html;
-    if (!game || game.phase !== 'deploy') updateInfo();
+    updateInfo();
+  }
+
+  // ---------- Ширма ----------
+
+  function renderScreen() {
+    const a = actor();
+    let tabs = [], factionId, seatNum = null;
+    const assigned = game && game.seats.filter((s) => s.faction);
+    if (!game || !assigned.length || game.phase === 'factions' || game.phase === 'pick') {
+      // До выбора — предпросмотр фракций
+      tabs = [1, 2, 3, 4].map((f) => ({ key: 'f' + f, label: F[f].name, cls: 'f' + f, on: ui.previewFaction === f }));
+      factionId = ui.previewFaction;
+    } else {
+      seatNum = ui.screenSeat || (a && a.seat) || assigned[0].seat;
+      if (!E.seatOf(game, seatNum).faction) seatNum = assigned[0].seat;
+      tabs = assigned.map((s) => ({ key: 's' + s.seat, label: `Игрок ${s.seat} · ${F[s.faction].name}`, cls: 'f' + s.faction, on: s.seat === seatNum, now: a && a.seat === s.seat }));
+      factionId = E.seatOf(game, seatNum).faction;
+    }
+    $tabs.innerHTML = tabs.map((t) => `<button class="tab ${t.cls} ${t.on ? 'on' : ''}" data-tab="${t.key}">${esc(t.label)}${t.now ? ' <i>ходит</i>' : ''}</button>`).join('');
+    $screen.innerHTML = Screen.render(E, factionId, game && seatNum ? game : null, seatNum, { activeId: a && a.id });
   }
 
   function updateInfo() {
-    if (!game) { $info.textContent = 'Карта «Эскиз v1» 28×22. Сплошные линии — стены, пунктир — полустены, «?» — жетоны.'; return; }
+    if (!game) { $info.textContent = 'Карта «Эскиз v1» 28×22. Сплошные линии — стены, синий пунктир — полустены, «?» — жетоны.'; return; }
+    if (game.phase === 'deploy' && !ui.hover) {
+      const d = E.deployCurrent(game);
+      $info.innerHTML = `Ставит: <b class="chip-text f${d.faction}">${esc(ename(d))}</b> · место ${d.slot} на колесе`;
+      return;
+    }
     const u = ui.hover && E.unitAt(game, ...E.unkey(ui.hover));
     if (u) {
       const tgt = game.phase === 'battle' && !ui.busy && E.turnTargets(game).find((t) => t.id === u.id);
       const a = tgt && E.current(game);
-      $info.innerHTML = `<b class="chip-text f${u.faction}">${esc(ename(u))}</b> · здоровье ${u.hp}/${u.maxHp} · ${statLine(u)}`
+      const stats = u.kind === 'unit' ? `здоровье ${u.hp}/${u.maxHp} · броня ${u.armor} · атака ${u.atk >= 0 ? '+' : ''}${u.atk} ${u.atkType === 'ranged' ? 'дальняя ' + u.range : 'ближняя'} · скорость ${u.speed}${u.flying ? ' (летает)' : ''} · инициатива ${u.init}` : '';
+      $info.innerHTML = `<b class="chip-text f${u.faction}">${esc(ename(u))}</b> · ${stats}`
         + (tgt ? ` · <b>атака: к6 + ${a.atk}${tgt.penalty ? ' − ' + tgt.penalty : ''} − броня ${u.armor}</b>` : '');
       return;
     }
@@ -412,6 +461,7 @@
     drawUnits();
     renderWheel();
     renderPanel();
+    renderScreen();
   }
 
   function flash(msg) {
@@ -435,7 +485,11 @@
     });
   }
 
-  const TOKEN_TEXT = { gold: () => `золото +${E.TOKEN_GOLD} монет`, item: () => 'предмет (заглушка)', trap: () => `ловушка: ${E.TOKEN_TRAP_DAMAGE} чистого урона` };
+  function tokenText(tok) {
+    if (tok.kind === 'coins') return `<span class="coin-badge">${tok.value}</span> монет`;
+    if (tok.kind === 'item') return '<span class="tok-badge item">предмет</span> (эффект добавим позже)';
+    return '<span class="tok-badge trap">ловушка</span> (эффект добавим позже)';
+  }
 
   async function playEvents(events) {
     const items = [];
@@ -444,15 +498,18 @@
       const who = ev.entity && E.entity(game, ev.entity);
       if (ev.type === 'move') {
         await animatePath(ev.entity, ev.path);
-      } else if (ev.type === 'roll' && ev.purpose === 'order') {
-        const s = E.seatOf(game, ev.seat);
-        items.push({ sides: 6, value: ev.value, caption: fname(s.faction) + (ev.attempt > 1 ? ' · переброс' : ''), cls: 'f' + s.faction, batch: ev.attempt });
+      } else if (ev.type === 'roll' && (ev.purpose === 'order' || ev.purpose === 'pick')) {
+        items.push({ sides: 6, value: ev.value, caption: 'Игрок ' + ev.seat + (ev.attempt > 1 ? ' · переброс' : ''), cls: seatCls(ev.seat), batch: ev.purpose + ev.attempt });
+      } else if (ev.type === 'pickOrder') {
+        lines.push('Порядок выбора фракций: ' + ev.order.map((sn) => '<b>Игрок ' + sn + '</b>').join(' → '));
+      } else if (ev.type === 'faction') {
+        lines.push(`Игрок ${ev.seat} играет за <b class="chip-text f${ev.faction}">${esc(fname(ev.faction))}</b>${ev.random ? ' (случайно)' : ''}`);
       } else if (ev.type === 'order') {
-        lines.push('Порядок хода: ' + ev.order.map((sn) => `<b class="chip-text f${E.seatOf(game, sn).faction}">${fname(E.seatOf(game, sn).faction)}</b>`).join(' → '));
+        lines.push('Первым бросает к30: ' + ev.order.map((sn) => `<b class="chip-text ${seatCls(sn)}">${esc(sname(sn))}</b>`).join(' → '));
       } else if (ev.type === 'roll' && ev.purpose === 'initiative') {
         items.push({ sides: 30, value: ev.value, caption: 'к30 · ' + esc(ename(who)), cls: 'f' + who.faction });
       } else if (ev.type === 'slot') {
-        if (ev.forced) lines.push(`${esc(ename(who))} автоматически встаёт на место <b>${ev.slot}</b>`);
+        if (ev.forced) lines.push(`${esc(ename(who))} встаёт на место <b>${ev.slot}</b>`);
       } else if (ev.type === 'roll' && (ev.purpose === 'attack' || ev.purpose === 'counter')) {
         items.push({
           sides: 6, value: ev.value, cls: 'f' + who.faction,
@@ -462,13 +519,27 @@
       } else if (ev.type === 'roll' && ev.purpose === 'counterCheck') {
         items.push({ sides: 6, value: ev.value, cls: 'f' + who.faction, caption: 'Отпор? нужно 4–6', note: ev.success ? '<b>да</b>' : 'нет', good: ev.success });
       } else if (ev.type === 'damage') {
-        lines.push(`${esc(ename(who))}: ${ev.raw}${ev.pure ? ' (чистый урон)' : ' − броня ' + ev.armor} = <b>${ev.amount}</b> урона · здоровье ${ev.hpLeft}`);
+        lines.push(`${esc(ename(who))}: ${ev.source ? esc(ev.source) + ', ' : ''}${ev.raw}${ev.pure ? ' <b class="pure">чистого</b>' : ' − броня ' + ev.armor} = <b>${ev.amount}</b> урона · ♥ ${ev.hpLeft}`);
+      } else if (ev.type === 'immune') {
+        lines.push(`${esc(ename(who))}: урона нет — ${esc(ev.reason)}`);
+      } else if (ev.type === 'heal') {
+        lines.push(`${esc(ename(who))}: <b class="heal">+${ev.amount}</b> здоровья (${esc(ev.source)}) · ♥ ${ev.hpLeft}`);
+      } else if (ev.type === 'coins') {
+        lines.push(`<span class="coin-badge">+${ev.amount}</span> монет: ${esc(ev.source)}`);
       } else if (ev.type === 'death') {
         lines.push(`<b>${esc(ename(who))} погибает</b>`);
       } else if (ev.type === 'out') {
-        lines.push(`<b>${fname(E.seatOf(game, ev.seat).faction)} выбывают</b>`);
+        lines.push(`<b>${esc(sname(ev.seat))} выбывает</b>`);
       } else if (ev.type === 'token') {
-        lines.push(`Жетон открыт: ${TOKEN_TEXT[ev.content]()}`);
+        lines.push(`Жетон: ${tokenText(ev.token)}`);
+      } else if (ev.type === 'ability') {
+        lines.push(`<b>${esc(ev.name)}</b>: ${esc(ename(who))} → ${esc(ename(E.entity(game, ev.target)))}`);
+      } else if (ev.type === 'swallowed') {
+        lines.push(`${esc(ename(who))} проглочен: исчез с карты и колеса`);
+      } else if (ev.type === 'released') {
+        lines.push(`${esc(ename(who))} возвращается на ${E.cellName(...ev.cell)}`);
+      } else if (ev.type === 'roundEnd') {
+        lines.push(`Конец круга ${ev.round}`);
       } else if (ev.type === 'turnEnded') {
         lines.push(`Ход окончен (${ev.reason})`);
       } else if (ev.type === 'shift') {
@@ -487,6 +558,7 @@
     if (!res.ok) return flash(res.error);
     ui.busy = true;
     ui.preview = null;
+    ui.mode = 'attack';
     drawOverlay();
     renderWheel();
     try {
@@ -502,14 +574,12 @@
   function onCellClick(c, r) {
     if (!game || ui.busy) return;
     const k = E.key(c, r);
-    if (game.phase === 'deploy') {
-      const res = E.deploy(game, c, r);
-      if (!res.ok) return flash(res.error);
-      return render();
-    }
+    if (game.phase === 'deploy') return act(() => E.deploy(game, c, r));
     if (game.phase !== 'battle') return;
+    if (game.pending && game.pending.type === 'return') return act(() => E.chooseReturnCell(game, c, r));
     const there = E.unitAt(game, c, r);
-    if (there && E.turnTargets(game).some((t) => t.id === there.id)) return act(() => E.attack(game, there.id));
+    if (there && ui.mode === 'ability' && E.abilityTargets(game).includes(there.id)) return act(() => E.useAbility(game, there.id));
+    if (there && ui.mode === 'attack' && E.turnTargets(game).some((t) => t.id === there.id)) return act(() => E.attack(game, there.id));
     const reach = E.turnReach(game);
     if (reach && reach.cells.has(k)) {
       if (ui.preview === k) return act(() => E.move(game, c, r));
@@ -534,7 +604,7 @@
       ui.preview = k && reach && reach.cells.has(k) ? k : null;
     }
     drawOverlay();
-    if (!game || game.phase !== 'deploy') updateInfo();
+    updateInfo();
   });
   $board.addEventListener('pointerleave', () => { ui.hover = null; drawOverlay(); updateInfo(); });
 
@@ -542,7 +612,7 @@
     const g = ev.target.closest('[data-slot]');
     if (!g || !game || ui.busy) return;
     const slot = Number(g.dataset.slot);
-    if (game.phase === 'initiative' && game.pendingInit) return act(() => E.chooseInitiative(game, slot));
+    if (game.pendingInit) return act(() => E.chooseInitiative(game, slot));
     if (game.phase === 'battle' && E.shiftOptions(game).includes(slot)) return act(() => E.shift(game, slot));
   });
   $wheel.addEventListener('pointerover', (ev) => {
@@ -551,15 +621,34 @@
     if (s !== ui.hoverSlot) { ui.hoverSlot = s; renderWheel(); }
   });
 
+  $tabs.addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-tab]');
+    if (!b) return;
+    const t = b.dataset.tab;
+    if (t[0] === 'f') ui.previewFaction = Number(t.slice(1));
+    else {
+      const n = Number(t.slice(1));
+      const a = actor();
+      ui.screenSeat = a && a.seat === n ? null : n; // клик по ходящему — снова «следить за ходом»
+    }
+    renderScreen();
+  });
+
+  $panel.addEventListener('pointerover', (ev) => {
+    const b = ev.target.closest('[data-action="pick-faction"]');
+    if (b && Number(b.dataset.f) !== ui.previewFaction) { ui.previewFaction = Number(b.dataset.f); renderScreen(); }
+  });
+
   $panel.addEventListener('click', (ev) => {
     const b = ev.target.closest('button[data-action]');
     if (!b || ui.busy) return;
     const a = b.dataset.action;
     if (a === 'start') {
-      const seats = [1, 2, 3, 4].filter((z) => ui.lobby[z]).map((z) => ({ seat: z, faction: ui.lobby[z] }));
+      const seats = [1, 2, 3, 4].filter((z) => ui.lobby[z]);
       game = E.createGame(MAP, { seats });
+      ui.screenSeat = null;
       drawMap();
-      Dice.note($tray, 'Бросьте к6 за очерёдность.');
+      Dice.note($tray, 'Бросьте к6: кто первым выбирает фракцию.');
       return render();
     }
     if (a === 'new') {
@@ -568,22 +657,27 @@
       Dice.note($tray, 'Здесь будут броски кубиков.');
       return render();
     }
+    const redraw = (res) => { drawMap(); return res; };
+    if (a === 'roll-pick') return act(() => E.rollPickOrder(game));
+    if (a === 'random-factions') return act(() => redraw(E.randomFactions(game)));
+    if (a === 'pick-faction') return act(() => redraw(E.pickFaction(game, Number(b.dataset.f))));
     if (a === 'roll-order') return act(() => E.rollOrder(game));
     if (a === 'roll-init') return act(() => E.rollInitiative(game));
     if (a === 'auto-init') return act(() => {
-      const r = E.autoInitiative(game);
-      return { ok: true, events: [{ type: 'text', text: 'Инициатива определена автоматически для всех оставшихся.' }], all: r };
+      E.autoInitiative(game);
+      return { ok: true, events: [{ type: 'text', text: 'Инициатива определена автоматически для всех оставшихся.' }] };
     });
     if (a === 'pick-slot') return act(() => E.chooseInitiative(game, Number(b.dataset.slot)));
-    if (a === 'auto-deploy') { E.autoDeploy(game); return render(); }
+    if (a === 'auto-deploy') return act(() => E.autoDeploy(game));
     if (a === 'undo-move') { E.undoMove(game); return render(); }
     if (a === 'end-turn') return act(() => E.endTurn(game));
+    if (a === 'toggle-ability') { ui.mode = ui.mode === 'ability' ? 'attack' : 'ability'; return render(); }
   });
 
   $panel.addEventListener('change', (ev) => {
     const i = ev.target;
     if (i.dataset.action === 'lobby') {
-      ui.lobby[Number(i.dataset.z)] = Number(i.value);
+      ui.lobby[Number(i.dataset.z)] = i.checked;
       drawMap();
       render();
     }
@@ -592,7 +686,7 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.target.tagName === 'SELECT' || ev.target.tagName === 'INPUT') return;
     if (ev.key === 'Enter' && game && game.phase === 'battle' && !ui.busy) act(() => E.endTurn(game));
-    if (ev.key === 'Escape') { ui.preview = null; drawOverlay(); }
+    if (ev.key === 'Escape') { ui.preview = null; ui.mode = 'attack'; render(); }
   });
 
   // Доступ из консоли браузера для отладки: NHDebug.game()

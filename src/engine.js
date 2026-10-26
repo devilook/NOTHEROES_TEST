@@ -1,9 +1,11 @@
 // Игровая логика «НЕ ГЕРОИ». Чистые функции без DOM — этот же модуль
-// потом будет работать на сервере. Правила: docs/rules.md.
+// потом будет работать на сервере. Правила: docs/rules.md, фракции: src/factions.js.
 //
 // Партия — конечный автомат по фазам:
-//   order      бросок к6 за очерёдность игроков
-//   initiative по очереди: к30 и выбор места на колесе для каждого юнита, затем героев
+//   pick       к6: кто первым выбирает фракцию (или случайная раздача)
+//   factions   игроки по очереди выбирают фракции
+//   order      к6: кто первым бросает к30 за инициативу
+//   initiative по очереди: к30 и выбор места на колесе для юнитов 1…5, затем героев
 //   deploy     расстановка юнитов в стартовые зоны в порядке колеса
 //   battle     ходы по колесу 1→30, по кругу
 //   over       победитель определён
@@ -11,35 +13,20 @@
 // Каждое действие возвращает { ok, error?, events[] }. События (броски, урон, смерть,
 // жетоны) интерфейс проигрывает как анимацию.
 (function (root, factory) {
-  const api = factory();
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  else root.NHEngine = api;
-})(typeof self !== 'undefined' ? self : this, function () {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('./factions.js'));
+  else root.NHEngine = factory(root.NHFactions);
+})(typeof self !== 'undefined' ? self : this, function (FACTIONS) {
   'use strict';
-
-  const FACTIONS = {
-    1: { id: 1, key: 'bastion', name: 'Бастион', colorName: 'жёлтые' },
-    2: { id: 2, key: 'sylvans', name: 'Сильваны', colorName: 'зелёные' },
-    3: { id: 3, key: 'demons', name: 'Демоны', colorName: 'красные' },
-    4: { id: 4, key: 'undead', name: 'Нечисть', colorName: 'синие' },
-  };
-
-  // Тестовые параметры: одинаковые у всех, пока нет карт юнитов.
-  const TEST_UNIT = {
-    hp: 10, armor: 1, atk: 1, atkType: 'melee', range: 1,
-    speed: 5, init: 3, counter: '=', flying: false,
-  };
-  const TEST_HERO = { init: 3 };
 
   const SLOTS = 30;
   // Стартовые зоны по часовой стрелке вокруг стола: 1 (низ-лево) → 3 → 4 → 2.
   const CLOCKWISE = [1, 3, 4, 2];
   const ROMAN = ['I', 'II', 'III', 'IV', 'V'];
 
-  // Содержимое жетонов «?» — заглушка, пока нет настоящих.
-  const TOKEN_BAG = { gold: 12, item: 10, trap: 8 };
-  const TOKEN_GOLD = 5;
-  const TOKEN_TRAP_DAMAGE = 2;
+  // Жетоны «?» (присылка 5): 15 монет, 5 ловушек, 10 предметов.
+  const TOKEN_COINS = [20, 20, 30, 30, 40, 40, 50, 50, 60, 60, 70, 70, 80, 80, 100];
+  const TOKEN_TRAPS = 5;
+  const TOKEN_ITEMS = 10;
 
   const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]];
   const key = (c, r) => c + ',' + r;
@@ -107,50 +94,40 @@
     return arr;
   }
 
-  // seats: [{ seat: 1..4 (= стартовая зона), faction: 1..4 }]
+  // seats: номера стартовых зон игроков, например [1, 4]. Игрок = зона.
   function createGame(mapDef, opts) {
     opts = opts || {};
     const rng = opts.rng || Math.random;
     const map = parseMap(mapDef);
-    const seatsIn = opts.seats || [{ seat: 1, faction: 1 }, { seat: 2, faction: 3 }];
-    const unitStats = Object.assign({}, TEST_UNIT, opts.unitStats);
-    const heroStats = Object.assign({}, TEST_HERO, opts.heroStats);
+    const seatNums = (opts.seats || [1, 4]).map((s) => (typeof s === 'object' ? s.seat : s));
+    const seats = seatNums.map((n) => ({ seat: n, faction: 0, zone: n, coins: 0, items: 0, traps: 0, out: false }));
 
-    const seats = seatsIn.map((s) => ({
-      seat: s.seat, faction: s.faction, zone: s.seat, coins: 0, items: [], out: false,
-    }));
-
-    const entities = [];
-    for (const s of seats) {
-      for (let n = 1; n <= 5; n++) {
-        entities.push(Object.assign({}, unitStats, {
-          id: 's' + s.seat + 'u' + n, kind: 'unit', seat: s.seat, faction: s.faction,
-          num: n, label: String(n), maxHp: unitStats.hp, alive: true, pos: null, slot: null,
-        }));
-      }
-      entities.push(Object.assign({}, heroStats, {
-        id: 's' + s.seat + 'h', kind: 'hero', seat: s.seat, faction: s.faction,
-        num: 0, label: 'Г', alive: true, pos: null, slot: null,
-      }));
-    }
-
-    const bag = [];
-    for (const k in TOKEN_BAG) for (let i = 0; i < TOKEN_BAG[k]; i++) bag.push(k);
+    const bag = TOKEN_COINS.map((v) => ({ kind: 'coins', value: v }));
+    for (let i = 0; i < TOKEN_TRAPS; i++) bag.push({ kind: 'trap' });
+    for (let i = 0; i < TOKEN_ITEMS; i++) bag.push({ kind: 'item' });
     shuffle(bag, rng);
     const tokens = {};
-    map.tokenSpots.forEach(([c, r], i) => { tokens[key(c, r)] = { content: bag[i % bag.length] }; });
+    map.tokenSpots.forEach(([c, r], i) => { tokens[key(c, r)] = bag[i % bag.length]; });
 
-    return {
-      map, rng, seats, entities, tokens,
-      phase: 'order',
-      order: [],              // места игроков в порядке хода
+    const state = {
+      map, rng, seats, entities: [], tokens,
+      phase: 'pick',
+      pickOrder: [], pickIndex: 0,
+      order: [],              // порядок игроков для бросков инициативы
       wheel: new Array(SLOTS + 1).fill(null), // wheel[1..30] = id сущности
       initQueue: [], initIndex: 0, pendingInit: null,
       deployQueue: [], deployIndex: 0,
       pointer: 0, round: 1, turn: null,
+      pending: null,          // ожидание ввода посреди боя (возврат проглоченного)
       winner: null,
       log: [],
     };
+    // Быстрый старт для тестов: фракции заданы сразу.
+    if (opts.factions) {
+      seats.forEach((s, i) => assignFaction(state, s, opts.factions[i]));
+      state.phase = 'order';
+    }
+    return state;
   }
 
   const roll = (state, sides) => 1 + Math.floor(state.rng() * sides);
@@ -167,47 +144,133 @@
     return state.entities.find((e) => e.alive && e.pos && e.pos[0] === c && e.pos[1] === r) || null;
   }
 
+  const has = (e, id) => !!(e && e.ability && e.ability.id === id);
+
+  function seatHas(state, seatNum, id) {
+    const s = seatOf(state, seatNum);
+    const f = FACTIONS[s.faction];
+    return !!f && ((f.ability && f.ability.id === id) || (f.hero.ability && f.hero.ability.id === id));
+  }
+
   function entityName(state, e) {
-    const f = FACTIONS[e.faction].name;
-    return e.kind === 'hero' ? f + ', герой' : f + ' ' + e.label;
+    const f = FACTIONS[e.faction];
+    if (e.kind === 'hero') return f.hero.name + ' (' + f.name + ')';
+    return f.test ? f.name + ' ' + e.name : e.name + ' (' + f.name + ')';
+  }
+
+  function seatName(state, seatNum) {
+    const s = seatOf(state, seatNum);
+    return 'Игрок ' + seatNum + (s.faction ? ' · ' + FACTIONS[s.faction].name : '');
   }
 
   function log(state, text, extra) {
     state.log.push(Object.assign({ round: state.round, text }, extra));
   }
 
-  // ---------- Фаза order: к6 за очерёдность ----------
-
-  function rollOrder(state) {
-    if (state.phase !== 'order') return { ok: false, error: 'Очерёдность уже определена' };
+  // Бросок к6 всеми игроками: максимум побеждает, ничья у лидеров — переброс.
+  // Порядок — по часовой стрелке от победителя.
+  function rollClockwise(state, purpose) {
     const events = [];
     let contenders = state.seats.map((s) => s.seat);
     let attempt = 1;
     while (contenders.length > 1) {
       const rolls = contenders.map((seat) => ({ seat, value: roll(state, 6) }));
-      for (const x of rolls) events.push({ type: 'roll', die: 6, value: x.value, seat: x.seat, purpose: 'order', attempt });
+      for (const x of rolls) events.push({ type: 'roll', die: 6, value: x.value, seat: x.seat, purpose, attempt });
       const max = Math.max(...rolls.map((x) => x.value));
       contenders = rolls.filter((x) => x.value === max).map((x) => x.seat);
       attempt++;
     }
-    const first = contenders[0];
     const present = CLOCKWISE.filter((z) => state.seats.some((s) => s.seat === z));
-    const i = present.indexOf(first);
-    state.order = present.slice(i).concat(present.slice(0, i));
-    log(state, 'Первым ходит ' + FACTIONS[seatOf(state, first).faction].name + '. Порядок: ' +
-      state.order.map((s) => FACTIONS[seatOf(state, s).faction].name).join(' → '));
+    const i = present.indexOf(contenders[0]);
+    return { events, order: present.slice(i).concat(present.slice(0, i)) };
+  }
 
-    // Очередь инициативы: юниты I всех игроков, юниты II, …, затем герои.
+  // ---------- Фазы pick и factions ----------
+
+  function rollPickOrder(state) {
+    if (state.phase !== 'pick') return { ok: false, error: 'Порядок выбора уже определён' };
+    const r = rollClockwise(state, 'pick');
+    state.pickOrder = r.order;
+    state.pickIndex = 0;
+    state.phase = 'factions';
+    log(state, 'Первым выбирает фракцию Игрок ' + r.order[0] + '. Порядок выбора: ' + r.order.map((s) => 'Игрок ' + s).join(' → '));
+    r.events.push({ type: 'pickOrder', order: r.order.slice() });
+    return { ok: true, events: r.events };
+  }
+
+  function picker(state) {
+    return state.phase === 'factions' ? state.pickOrder[state.pickIndex] : null;
+  }
+
+  const takenFactions = (state) => state.seats.map((s) => s.faction).filter(Boolean);
+
+  function assignFaction(state, seat, f) {
+    seat.faction = f;
+    const data = FACTIONS[f];
+    seat.coins = data.hero.coins;
+    data.units.forEach((u, i) => {
+      state.entities.push(Object.assign({}, u, {
+        id: 's' + seat.seat + 'u' + (i + 1), kind: 'unit', seat: seat.seat, faction: f,
+        num: i + 1, label: String(i + 1), maxHp: u.hp, alive: true, pos: null, slot: null,
+        abilityState: u.ability && u.ability.kind === 'active' ? 'ready' : null,
+      }));
+    });
+    state.entities.push({
+      id: 's' + seat.seat + 'h', kind: 'hero', seat: seat.seat, faction: f, num: 0, label: 'Г',
+      name: data.hero.name, init: data.hero.init, ability: data.hero.ability,
+      alive: true, pos: null, slot: null,
+    });
+  }
+
+  function pickFaction(state, f) {
+    if (state.phase !== 'factions') return { ok: false, error: 'Сейчас не выбор фракций' };
+    if (!FACTIONS[f] || takenFactions(state).includes(f)) return { ok: false, error: 'Эта фракция уже занята' };
+    const seat = seatOf(state, picker(state));
+    assignFaction(state, seat, f);
+    log(state, 'Игрок ' + seat.seat + ' играет за ' + FACTIONS[f].name, { seat: seat.seat });
+    state.pickIndex++;
+    if (state.pickIndex >= state.pickOrder.length) afterFactions(state);
+    return { ok: true, events: [{ type: 'faction', seat: seat.seat, faction: f }] };
+  }
+
+  // Случайная раздача всем, у кого ещё нет фракции. Можно вместо броска к6.
+  function randomFactions(state) {
+    if (state.phase !== 'pick' && state.phase !== 'factions') return { ok: false, error: 'Фракции уже выбраны' };
+    const free = shuffle([1, 2, 3, 4].filter((f) => !takenFactions(state).includes(f)), state.rng);
+    const events = [];
+    for (const s of state.seats) {
+      if (s.faction) continue;
+      assignFaction(state, s, free.shift());
+      log(state, 'Игрок ' + s.seat + ' играет за ' + FACTIONS[s.faction].name + ' (случайно)', { seat: s.seat });
+      events.push({ type: 'faction', seat: s.seat, faction: s.faction, random: true });
+    }
+    afterFactions(state);
+    return { ok: true, events };
+  }
+
+  function afterFactions(state) {
+    state.phase = 'order';
+    // Сущности — в порядке зон, чтобы id и порядок не зависели от очереди выбора.
+    state.entities.sort((a, b) => a.seat - b.seat || (a.kind === 'hero') - (b.kind === 'hero') || a.num - b.num);
+  }
+
+  // ---------- Фаза order: кто первым бросает к30 ----------
+
+  function rollOrder(state) {
+    if (state.phase !== 'order') return { ok: false, error: 'Сейчас не определение очерёдности' };
+    const r = rollClockwise(state, 'order');
+    state.order = r.order;
+    log(state, 'Первым бросает инициативу Игрок ' + r.order[0] + '. Порядок: ' + r.order.map((s) => seatName(state, s)).join(' → '));
     state.initQueue = [];
     for (let n = 1; n <= 5; n++) for (const s of state.order) state.initQueue.push('s' + s + 'u' + n);
     for (const s of state.order) state.initQueue.push('s' + s + 'h');
     state.initIndex = 0;
     state.phase = 'initiative';
-    events.push({ type: 'order', order: state.order.slice() });
-    return { ok: true, events };
+    r.events.push({ type: 'order', order: state.order.slice() });
+    return { ok: true, events: r.events };
   }
 
-  // ---------- Фаза initiative: к30 и место на колесе ----------
+  // ---------- Колесо: выбор места ----------
 
   const freeSlots = (state) => {
     const out = [];
@@ -240,15 +303,14 @@
     return { mode: 'choose', options };
   }
 
-  function initCurrent(state) {
-    if (state.phase !== 'initiative') return null;
-    return entity(state, state.initQueue[state.initIndex]);
+  function placeOnWheel(state, e, slot) {
+    if (e.slot) state.wheel[e.slot] = null;
+    state.wheel[slot] = e.id;
+    e.slot = slot;
   }
 
-  function rollInitiative(state) {
-    const e = initCurrent(state);
-    if (!e) return { ok: false, error: 'Сейчас не определение инициативы' };
-    if (state.pendingInit) return { ok: false, error: 'Сначала выберите место на колесе' };
+  // Бросок к30 для e. Возвращает события; если нужен выбор — заводит pendingInit.
+  function determineInitiative(state, e, inBattle) {
     const value = roll(state, SLOTS);
     const opt = initiativeOptions(state, e, value);
     const events = [{ type: 'roll', die: SLOTS, value, entity: e.id, purpose: 'initiative' }];
@@ -256,11 +318,26 @@
       placeOnWheel(state, e, opt.slot);
       log(state, entityName(state, e) + ': к30 = ' + value + ', ' + opt.reason + ' → место ' + opt.slot, { seat: e.seat });
       events.push({ type: 'slot', entity: e.id, slot: opt.slot, forced: true });
-      advanceInit(state);
     } else {
-      state.pendingInit = { entity: e.id, value, mode: opt.mode, options: opt.options };
+      state.pendingInit = { entity: e.id, value, mode: opt.mode, options: opt.options, battle: !!inBattle };
     }
-    return { ok: true, events, forced: opt.mode === 'forced' };
+    return events;
+  }
+
+  function initCurrent(state) {
+    if (state.pendingInit) return entity(state, state.pendingInit.entity);
+    if (state.phase !== 'initiative') return null;
+    return entity(state, state.initQueue[state.initIndex]);
+  }
+
+  function rollInitiative(state) {
+    if (state.phase !== 'initiative') return { ok: false, error: 'Сейчас не определение инициативы' };
+    if (state.pendingInit) return { ok: false, error: 'Сначала выберите место на колесе' };
+    const e = initCurrent(state);
+    const events = determineInitiative(state, e, false);
+    const forced = !state.pendingInit;
+    if (forced) advanceInit(state);
+    return { ok: true, events, forced };
   }
 
   function chooseInitiative(state, slot) {
@@ -271,14 +348,10 @@
     placeOnWheel(state, e, slot);
     log(state, entityName(state, e) + ': к30 = ' + p.value + ' → место ' + slot, { seat: e.seat });
     state.pendingInit = null;
-    advanceInit(state);
-    return { ok: true, events: [{ type: 'slot', entity: e.id, slot }] };
-  }
-
-  function placeOnWheel(state, e, slot) {
-    if (e.slot) state.wheel[e.slot] = null;
-    state.wheel[slot] = e.id;
-    e.slot = slot;
+    const events = [{ type: 'slot', entity: e.id, slot }];
+    if (p.battle) events.push(...advance(state));
+    else advanceInit(state);
+    return { ok: true, events };
   }
 
   function advanceInit(state) {
@@ -293,6 +366,9 @@
     log(state, 'Инициатива определена. Расстановка в порядке колеса.');
   }
 
+  // Ближайшее к выпавшему доступное место (для автоматического выбора).
+  const bestOption = (p) => p.options.slice().sort((a, b) => Math.abs(a - p.value) - Math.abs(b - p.value) || a - b)[0];
+
   // Бросить и выбрать за всех оставшихся: исходное место, а если занято — ближайшее доступное.
   function autoInitiative(state) {
     const events = [];
@@ -302,9 +378,7 @@
         events.push(...r.events);
         if (r.forced) continue;
       }
-      const p = state.pendingInit;
-      const best = p.options.slice().sort((a, b) => Math.abs(a - p.value) - Math.abs(b - p.value) || a - b)[0];
-      events.push(...chooseInitiative(state, best).events);
+      events.push(...chooseInitiative(state, bestOption(state.pendingInit)).events);
     }
     return { ok: true, events };
   }
@@ -328,18 +402,20 @@
     const e = deployCurrent(state);
     e.pos = [c, r];
     state.deployIndex++;
-    if (state.deployIndex >= state.deployQueue.length) startBattle(state);
-    return { ok: true, events: [] };
+    const events = [];
+    if (state.deployIndex >= state.deployQueue.length) events.push(...startBattle(state));
+    return { ok: true, events };
   }
 
   function autoDeploy(state) {
+    const events = [];
     while (state.phase === 'deploy') {
       const e = deployCurrent(state);
       const free = state.map.zones[seatOf(state, e.seat).zone].filter(([c, r]) => canDeploy(state, c, r));
       const [c, r] = free[Math.floor(state.rng() * free.length)];
-      deploy(state, c, r);
+      events.push(...deploy(state, c, r).events);
     }
-    return { ok: true, events: [] };
+    return { ok: true, events };
   }
 
   // ---------- Фаза battle: колесо ----------
@@ -349,7 +425,7 @@
     state.round = 1;
     state.pointer = 0;
     log(state, 'Бой начался. Круг 1.');
-    advance(state);
+    return advance(state);
   }
 
   function nextOccupied(state, from) {
@@ -358,12 +434,14 @@
   }
 
   function advance(state) {
-    if (state.phase !== 'battle') return;
+    if (state.phase !== 'battle') return [];
+    const events = [];
     let s = nextOccupied(state, state.pointer);
     if (s === null) {
-      log(state, 'Конец круга ' + state.round + '. Способности фракций — пока нет.');
-      state.round++;
+      events.push(...endRound(state));
+      if (state.phase !== 'battle') return events;
       s = nextOccupied(state, 0);
+      if (s === null) return events;
     }
     state.pointer = s;
     const e = entity(state, state.wheel[s]);
@@ -373,29 +451,59 @@
       moved: false, acted: false,
       startPos: e.pos && e.pos.slice(),
     };
+    return events;
+  }
+
+  // Конец круга: срабатывают способности фракций. Общих событий нет.
+  function endRound(state) {
+    const events = [{ type: 'roundEnd', round: state.round }];
+    log(state, 'Конец круга ' + state.round + '.');
+    for (const s of state.seats) {
+      if (s.out || !seatHas(state, s.seat, 'regen2')) continue;
+      for (const u of state.entities) {
+        if (u.seat === s.seat && u.kind === 'unit' && u.alive && u.pos) events.push(...heal(state, u, 2, FACTIONS[s.faction].name));
+      }
+    }
+    state.round++;
+    return events;
   }
 
   function current(state) {
     return state.turn ? entity(state, state.turn.entity) : null;
   }
 
-  function endTurn(state) {
-    if (state.phase !== 'battle') return { ok: false, error: 'Бой не идёт' };
+  const blocked = (state) => !!(state.pending || state.pendingInit);
+
+  // Конец хода текущего персонажа + отложенные эффекты (возврат проглоченного).
+  function finishTurn(state) {
+    const e = current(state);
     state.turn = null;
-    advance(state);
-    return { ok: true, events: [] };
+    const events = [];
+    if (e && e.alive && e.swallowing) {
+      if (e.swallowing.stage === 'used') {
+        e.swallowing.stage = 'holding';
+      } else {
+        events.push(...beginReturn(state, e));
+        if (blocked(state)) return events;
+      }
+    }
+    events.push(...advance(state));
+    return events;
+  }
+
+  function endTurn(state) {
+    if (state.phase !== 'battle' || !state.turn) return { ok: false, error: 'Бой не идёт' };
+    if (blocked(state)) return { ok: false, error: 'Сначала завершите выбор' };
+    return { ok: true, events: finishTurn(state) };
   }
 
   // ---------- Движение ----------
 
-  function cellBlocked(state, c, r) {
-    return state.map.cells[r][c].kind === 'block';
-  }
-
   // Клетки, куда юнит дойдёт за budget шагов. Дейкстра по (клетка, направление):
   // меньше шагов, при равенстве меньше поворотов. Правила:
-  //  стена — никому; полустена — только летающим; юнит — насквозь только летающим,
-  //  вставать на занятую нельзя; жетон — встать можно, пройти насквозь нельзя.
+  //  стена — никому; полустена — только летающим; юнит — насквозь только летающим
+  //  (Призрак преградой не считается); вставать на занятую нельзя;
+  //  жетон — встать можно, пройти насквозь нельзя.
   function computeReach(state, id, budget) {
     const u = entity(state, id);
     const result = { origin: u && u.pos, cells: new Map() };
@@ -418,11 +526,11 @@
       for (let d = 0; d < 4; d++) {
         const [dc, dr] = DIRS[d];
         const nc = cur.c + dc, nr = cur.r + dr;
-        if (!inBounds(state.map, nc, nr) || cellBlocked(state, nc, nr)) continue;
+        if (!inBounds(state.map, nc, nr) || state.map.cells[nr][nc].kind === 'block') continue;
         const edge = edgeBetween(state.map, cur.c, cur.r, dc, dr);
         if (edge === 'wall' || (edge === 'half' && !u.flying)) continue;
         const occ = unitAt(state, nc, nr);
-        if (occ && !u.flying) continue;
+        if (occ && !u.flying && !has(occ, 'incorporeal')) continue;
         const steps = cur.steps + 1;
         const turns = cur.turns + (cur.d !== -1 && cur.d !== d ? 1 : 0);
         const k2 = sk(nc, nr, d);
@@ -454,7 +562,7 @@
 
   function canMove(state) {
     const t = state.turn;
-    return !!(t && t.kind === 'unit' && !t.acted && t.mpLeft > 0);
+    return !!(t && !blocked(state) && t.kind === 'unit' && !t.acted && t.mpLeft > 0);
   }
 
   function turnReach(state) {
@@ -475,11 +583,8 @@
     if (target.token) {
       events.push(...openToken(state, u, c, r));
       checkVictory(state);
-      if (state.phase === 'battle') {
-        state.turn = null;
-        advance(state);
-      }
       events.push({ type: 'turnEnded', reason: 'жетон' });
+      if (state.phase === 'battle') events.push(...finishTurn(state));
     }
     return { ok: true, events, path: target.path };
   }
@@ -500,23 +605,84 @@
     const tok = state.tokens[k];
     delete state.tokens[k];
     const seat = seatOf(state, u.seat);
-    const events = [{ type: 'token', entity: u.id, content: tok.content, cell: [c, r] }];
-    if (tok.content === 'gold') {
-      seat.coins += TOKEN_GOLD;
-      log(state, entityName(state, u) + ' открыл жетон: золото +' + TOKEN_GOLD, { seat: u.seat });
-    } else if (tok.content === 'item') {
-      seat.items.push('Предмет (заглушка)');
-      log(state, entityName(state, u) + ' открыл жетон: предмет', { seat: u.seat });
+    const events = [{ type: 'token', entity: u.id, token: tok, cell: [c, r] }];
+    if (tok.kind === 'coins') {
+      seat.coins += tok.value;
+      log(state, entityName(state, u) + ' открыл жетон: ' + tok.value + ' монет', { seat: u.seat });
+    } else if (tok.kind === 'item') {
+      seat.items++;
+      log(state, entityName(state, u) + ' открыл жетон: предмет (эффект позже)', { seat: u.seat });
     } else {
-      log(state, entityName(state, u) + ' открыл жетон: ловушка', { seat: u.seat });
-      events.push(...applyDamage(state, u, TOKEN_TRAP_DAMAGE, { pure: true }));
+      seat.traps++;
+      log(state, entityName(state, u) + ' открыл жетон: ловушка (эффект позже)', { seat: u.seat });
+    }
+    return events;
+  }
+
+  // ---------- Урон и лечение ----------
+
+  function heal(state, e, amount, source) {
+    const before = e.hp;
+    e.hp = Math.min(e.maxHp, e.hp + amount);
+    if (e.hp === before) return [];
+    log(state, entityName(state, e) + ': +' + (e.hp - before) + ' здоровья (' + source + '), здоровье ' + e.hp, { seat: e.seat });
+    return [{ type: 'heal', entity: e.id, amount: e.hp - before, hpLeft: e.hp, source }];
+  }
+
+  // raw — урон до брони. opts: { pure, source }
+  function applyDamage(state, def, raw, opts) {
+    opts = opts || {};
+    if (opts.pure && has(def, 'pureImmune')) {
+      log(state, entityName(state, def) + ': чистый урон ' + raw + ' не действует (' + def.ability.name + ')', { seat: def.seat });
+      return [{ type: 'immune', entity: def.id, raw, reason: def.ability.name, source: opts.source }];
+    }
+    const armor = opts.pure ? 0 : def.armor;
+    const dmg = Math.max(0, raw - armor);
+    def.hp = Math.max(0, def.hp - dmg);
+    const events = [{ type: 'damage', entity: def.id, raw, armor, amount: dmg, hpLeft: def.hp, pure: !!opts.pure, source: opts.source }];
+    log(state, entityName(state, def) + ': ' + (opts.source ? opts.source + ', ' : '') + 'урон ' + raw +
+      (opts.pure ? ' (чистый)' : ' − броня ' + armor) + ' = ' + dmg + ', здоровье ' + def.hp, { seat: def.seat });
+    if (def.hp === 0) events.push(...kill(state, def));
+    return events;
+  }
+
+  function kill(state, e) {
+    e.alive = false;
+    const deathPos = e.pos;
+    e.pos = null;
+    if (e.slot) state.wheel[e.slot] = null;
+    e.slot = null;
+    log(state, entityName(state, e) + ' погибает', { seat: e.seat });
+    const events = [{ type: 'death', entity: e.id }];
+    const seat = seatOf(state, e.seat);
+    if (e.kind === 'unit' && seatHas(state, e.seat, 'collector50')) {
+      seat.coins += 50;
+      log(state, FACTIONS[seat.faction].hero.name + ': +50 монет (' + FACTIONS[seat.faction].hero.ability.name + ')', { seat: e.seat });
+      events.push({ type: 'coins', seat: e.seat, amount: 50, source: FACTIONS[seat.faction].hero.ability.name });
+    }
+    // Голем погиб с проглоченной целью — цель выходит сразу (допущение, вопрос 27).
+    if (e.swallowing) {
+      const t = entity(state, e.swallowing.target);
+      e.swallowing = null;
+      e.abilityState = 'spent';
+      const cell = nearestFreeCells(state, deathPos)[0];
+      events.push(...releaseSwallowed(state, t, cell, true));
+    }
+    const unitsLeft = state.entities.some((x) => x.seat === e.seat && x.kind === 'unit' && x.alive);
+    if (!unitsLeft && !seat.out) {
+      seat.out = true;
+      const hero = state.entities.find((x) => x.seat === e.seat && x.kind === 'hero');
+      if (hero.slot) state.wheel[hero.slot] = null;
+      hero.alive = false;
+      log(state, seatName(state, e.seat) + ' выбывает', { seat: e.seat });
+      events.push({ type: 'out', seat: e.seat });
     }
     return events;
   }
 
   // ---------- Бой ----------
 
-  // Цели атаки для юнита a (с его текущей позиции): [{ id, penalty }]
+  // Цели атаки для юнита a (с его текущей позиции): [{ id, penalty, dist }]
   function attackTargets(state, a) {
     if (!a || !a.alive || !a.pos) return [];
     const out = [];
@@ -530,8 +696,8 @@
         if (t && t.seat !== a.seat) out.push({ id: t.id, penalty: 0, dist: 1 });
         continue;
       }
-      // Дальняя: по прямой до range клеток. Стена обрывает линию,
-      // полустена и любой юнит на линии — штраф −1. Жетоны не мешают.
+      // Дальняя: по прямой до range клеток. Стена обрывает линию, полустена и юнит
+      // на линии — штраф −1 (Призрак не считается). Жетоны не мешают.
       let c = ac, r = ar, penalty = 0;
       for (let dist = 1; dist <= a.range; dist++) {
         const edge = edgeBetween(state.map, c, r, dc, dr);
@@ -542,7 +708,7 @@
         const t = unitAt(state, c, r);
         if (t) {
           if (t.seat !== a.seat) out.push({ id: t.id, penalty, dist });
-          penalty++;
+          if (!has(t, 'incorporeal')) penalty++;
         }
       }
     }
@@ -551,49 +717,29 @@
 
   function canAttack(state) {
     const t = state.turn;
-    return !!(t && t.kind === 'unit' && !t.acted);
+    return !!(t && !blocked(state) && t.kind === 'unit' && !t.acted);
   }
 
   function turnTargets(state) {
     return canAttack(state) ? attackTargets(state, current(state)) : [];
   }
 
-  // Бросок урона: к6 + атака − штраф; защитник вычитает броню. Минимум 0.
+  // Один удар: к6 + атака − штраф; защитник вычитает броню. Минимум 0.
+  // Плюс способности: Бестелесность, Кровопийца, Острый панцирь.
   function strike(state, atk, def, penalty, purpose) {
     const value = roll(state, 6);
     const raw = Math.max(0, value + atk.atk - penalty);
     const events = [{ type: 'roll', die: 6, value, entity: atk.id, target: def.id, purpose,
       mod: atk.atk, penalty, total: raw, armor: def.armor }];
-    events.push(...applyDamage(state, def, raw, { by: atk.id, purpose }));
-    return events;
-  }
-
-  function applyDamage(state, def, raw, opts) {
-    opts = opts || {};
-    const armor = opts.pure ? 0 : def.armor;
-    const dmg = Math.max(0, raw - armor);
-    def.hp = Math.max(0, def.hp - dmg);
-    const events = [{ type: 'damage', entity: def.id, raw, armor, amount: dmg, hpLeft: def.hp, pure: !!opts.pure, purpose: opts.purpose }];
-    log(state, entityName(state, def) + ': урон ' + raw + (armor ? ' − броня ' + armor : '') + ' = ' + dmg + ', здоровье ' + def.hp, { seat: def.seat });
-    if (def.hp === 0) events.push(...kill(state, def));
-    return events;
-  }
-
-  function kill(state, e) {
-    e.alive = false;
-    e.pos = null;
-    if (e.slot) state.wheel[e.slot] = null;
-    log(state, entityName(state, e) + ' погибает', { seat: e.seat });
-    const events = [{ type: 'death', entity: e.id }];
-    const seat = seatOf(state, e.seat);
-    const unitsLeft = state.entities.some((x) => x.seat === e.seat && x.kind === 'unit' && x.alive);
-    if (!unitsLeft && !seat.out) {
-      seat.out = true;
-      const hero = state.entities.find((x) => x.seat === e.seat && x.kind === 'hero');
-      if (hero.slot) state.wheel[hero.slot] = null;
-      hero.alive = false;
-      log(state, FACTIONS[seat.faction].name + ' выбывают', { seat: e.seat });
-      events.push({ type: 'out', seat: e.seat });
+    if (has(def, 'incorporeal') && value % 2 === 1) {
+      log(state, entityName(state, def) + ': на кости ' + value + ' — урона нет (' + def.ability.name + ')', { seat: def.seat });
+      events.push({ type: 'immune', entity: def.id, raw, reason: def.ability.name + ': выпало ' + value });
+    } else {
+      events.push(...applyDamage(state, def, raw));
+    }
+    if (atk.alive && has(atk, 'lifesteal1')) events.push(...heal(state, atk, 1, atk.ability.name));
+    if (atk.alive && atk.atkType === 'melee' && has(def, 'spikes2')) {
+      events.push(...applyDamage(state, atk, 2, { pure: true, source: def.ability.name }));
     }
     return events;
   }
@@ -601,7 +747,7 @@
   // Отпор: защитник с соседней клетки отвечает, если может достать атакующего.
   // «+» всегда, «Х» никогда, «=» к6: 4–6 — да.
   function counter(state, atk, def) {
-    if (!def.alive || !atk.alive) return [];
+    if (!def.alive || !atk.alive || !def.pos || !atk.pos) return [];
     const adjacent = Math.abs(atk.pos[0] - def.pos[0]) + Math.abs(atk.pos[1] - def.pos[1]) === 1;
     if (!adjacent || def.counter === 'x') return [];
     const reach = attackTargets(state, def).find((t) => t.id === atk.id);
@@ -618,6 +764,15 @@
     return events;
   }
 
+  // После действия: если юнит погиб или уже двигался — делать больше нечего, ход заканчивается.
+  function afterAction(state, a, events) {
+    checkVictory(state);
+    if (state.phase === 'battle' && state.turn && state.turn.entity === a.id && (!a.alive || state.turn.moved)) {
+      events.push({ type: 'turnEnded', reason: a.alive ? 'действие после движения' : 'гибель' });
+      events.push(...finishTurn(state));
+    }
+  }
+
   function attack(state, targetId) {
     if (!canAttack(state)) return { ok: false, error: 'Сейчас атаковать нельзя' };
     const a = current(state);
@@ -629,13 +784,113 @@
     const events = [{ type: 'attack', entity: a.id, target: d.id }];
     events.push(...strike(state, a, d, tgt.penalty, 'attack'));
     events.push(...counter(state, a, d));
-    checkVictory(state);
-    // Атакующий погиб от отпора или больше нечего делать — ход заканчивается сам.
-    if (state.phase === 'battle' && (!a.alive || state.turn.moved)) {
-      state.turn = null;
-      advance(state);
-      events.push({ type: 'turnEnded', reason: a.alive ? 'действие после движения' : 'гибель' });
+    afterAction(state, a, events);
+    return { ok: true, events };
+  }
+
+  // ---------- Активные способности ----------
+
+  // Способность с дальностью работает ортогонально и диагонально; стены мешают.
+  // По диагонали на 1 клетку — путь закрыт, если оба обхода через угол упираются в стену.
+  function abilityLineClear(state, a, b) {
+    const dc = b[0] - a[0], dr = b[1] - a[1];
+    const wall = (c, r, x, y) => edgeBetween(state.map, c, r, x, y) === 'wall';
+    if (Math.abs(dc) + Math.abs(dr) === 1) return !wall(a[0], a[1], dc, dr);
+    const viaH = !wall(a[0], a[1], dc, 0) && !wall(a[0] + dc, a[1], 0, dr);
+    const viaV = !wall(a[0], a[1], 0, dr) && !wall(a[0], a[1] + dr, dc, 0);
+    return viaH || viaV;
+  }
+
+  function abilityTargets(state) {
+    const t = state.turn;
+    if (!t || blocked(state) || t.kind !== 'unit' || t.acted) return [];
+    const a = current(state);
+    if (!a.ability || a.ability.kind !== 'active' || a.abilityState !== 'ready') return [];
+    const range = a.ability.range || 1;
+    return state.entities.filter((e) => e.alive && e.pos && e.id !== a.id &&
+      Math.max(Math.abs(e.pos[0] - a.pos[0]), Math.abs(e.pos[1] - a.pos[1])) <= range &&
+      (range > 1 || abilityLineClear(state, a.pos, e.pos))).map((e) => e.id);
+  }
+
+  function useAbility(state, targetId) {
+    if (!abilityTargets(state).includes(targetId)) return { ok: false, error: 'Способность сейчас недоступна для этой цели' };
+    const a = current(state);
+    const t = entity(state, targetId);
+    state.turn.acted = true;
+    const events = [{ type: 'ability', entity: a.id, target: t.id, name: a.ability.name }];
+    log(state, entityName(state, a) + ': ' + a.ability.name + ' → ' + entityName(state, t), { seat: a.seat });
+    if (a.ability.id === 'swallow') {
+      events.push(...applyDamage(state, t, 3, { pure: true, source: a.ability.name }));
+      if (t.alive) {
+        state.wheel[t.slot] = null;
+        t.slot = null;
+        t.pos = null;
+        t.swallowedBy = a.id;
+        a.swallowing = { target: t.id, stage: 'used' };
+        a.abilityState = 'active';
+        log(state, entityName(state, t) + ' проглочен: исчезает с карты и колеса', { seat: t.seat });
+        events.push({ type: 'swallowed', entity: t.id, by: a.id });
+      } else {
+        a.abilityState = 'spent';
+      }
     }
+    afterAction(state, a, events);
+    return { ok: true, events };
+  }
+
+  // Свободные клетки на минимальном расстоянии (по клеткам, без учёта стен) от from.
+  function nearestFreeCells(state, from) {
+    let best = Infinity, out = [];
+    for (let r = 0; r < state.map.rows; r++) for (let c = 0; c < state.map.cols; c++) {
+      if (state.map.cells[r][c].kind !== 'floor' || unitAt(state, c, r)) continue;
+      const d = Math.abs(c - from[0]) + Math.abs(r - from[1]);
+      if (d < best) { best = d; out = [[c, r]]; } else if (d === best) out.push([c, r]);
+    }
+    return out;
+  }
+
+  // Конец следующего хода голема: цель возвращается. Несколько ближайших клеток —
+  // выбирает владелец голема.
+  function beginReturn(state, golem) {
+    const options = nearestFreeCells(state, golem.pos);
+    if (options.length === 1) return releaseFromGolem(state, golem, options[0]);
+    state.pending = { type: 'return', golem: golem.id, target: golem.swallowing.target, options };
+    return [{ type: 'pending', pending: 'return' }];
+  }
+
+  function releaseFromGolem(state, golem, cell) {
+    const t = entity(state, golem.swallowing.target);
+    golem.swallowing = null;
+    golem.abilityState = 'spent';
+    log(state, entityName(state, golem) + ': способность закончилась', { seat: golem.seat });
+    return releaseSwallowed(state, t, cell, false);
+  }
+
+  // Цель выходит на клетку и заново определяет инициативу (к30).
+  function releaseSwallowed(state, t, cell, auto) {
+    t.pos = cell;
+    delete t.swallowedBy;
+    log(state, entityName(state, t) + ' возвращается на ' + cellName(cell[0], cell[1]), { seat: t.seat });
+    const events = [{ type: 'released', entity: t.id, cell }];
+    events.push(...determineInitiative(state, t, true));
+    if (auto && state.pendingInit) {
+      const p = state.pendingInit;
+      const slot = bestOption(p);
+      placeOnWheel(state, t, slot);
+      state.pendingInit = null;
+      log(state, entityName(state, t) + ': место ' + slot + ' (автоматически)', { seat: t.seat });
+      events.push({ type: 'slot', entity: t.id, slot, forced: true });
+    }
+    return events;
+  }
+
+  function chooseReturnCell(state, c, r) {
+    const p = state.pending;
+    if (!p || p.type !== 'return') return { ok: false, error: 'Сейчас не нужно выбирать клетку' };
+    if (!p.options.some(([x, y]) => x === c && y === r)) return { ok: false, error: 'Выберите одну из ближайших свободных клеток' };
+    state.pending = null;
+    const events = releaseFromGolem(state, entity(state, p.golem), [c, r]);
+    if (!state.pendingInit) events.push(...advance(state));
     return { ok: true, events };
   }
 
@@ -643,7 +898,7 @@
 
   function canShift(state) {
     const t = state.turn;
-    return !!(t && !t.moved);
+    return !!(t && !blocked(state) && !t.moved);
   }
 
   function shiftOptions(state) {
@@ -659,9 +914,9 @@
     placeOnWheel(state, e, slot);
     log(state, entityName(state, e) + ': инициатива ' + from + ' → ' + slot + (slot > from ? ' (ещё ход в этом круге)' : ''), { seat: e.seat });
     // Указатель остаётся на старом месте: если сдвиг вперёд, стрелка дойдёт до юнита снова.
-    state.turn = null;
-    advance(state);
-    return { ok: true, events: [{ type: 'shift', entity: e.id, from, to: slot }] };
+    const events = [{ type: 'shift', entity: e.id, from, to: slot }];
+    events.push(...finishTurn(state));
+    return { ok: true, events };
   }
 
   // ---------- Победа ----------
@@ -671,8 +926,10 @@
     if (alive.length <= 1 && state.phase === 'battle') {
       state.phase = 'over';
       state.turn = null;
+      state.pending = null;
+      state.pendingInit = null;
       state.winner = alive.length ? alive[0].seat : null;
-      log(state, alive.length ? 'Победа: ' + FACTIONS[alive[0].faction].name + '!' : 'Ничья');
+      log(state, alive.length ? 'Победа: ' + seatName(state, alive[0].seat) + '!' : 'Ничья');
     }
   }
 
@@ -682,12 +939,14 @@
   }
 
   return {
-    FACTIONS, TEST_UNIT, TEST_HERO, SLOTS, CLOCKWISE, ROMAN, TOKEN_GOLD, TOKEN_TRAP_DAMAGE,
-    key, unkey, parseMap, edgeBetween, createGame, entity, seatOf, unitAt, entityName,
+    FACTIONS, SLOTS, CLOCKWISE, ROMAN, TOKEN_COINS,
+    key, unkey, parseMap, edgeBetween, createGame, entity, seatOf, unitAt, entityName, seatName, has,
+    rollPickOrder, picker, pickFaction, randomFactions, takenFactions,
     rollOrder, initCurrent, initiativeOptions, rollInitiative, chooseInitiative, autoInitiative,
     deployCurrent, canDeploy, deploy, autoDeploy,
     current, computeReach, turnReach, canMove, move, undoMove,
     attackTargets, turnTargets, canAttack, attack,
+    abilityTargets, useAbility, chooseReturnCell, nearestFreeCells,
     canShift, shiftOptions, shift, endTurn, cellName,
   };
 });
